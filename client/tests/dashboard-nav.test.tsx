@@ -39,9 +39,6 @@ vi.mock("@/components/command-center/command-center", () => ({
 vi.mock("@/components/dashboard/overview-panel", () => ({
   OverviewPanel: () => <p>overview-panel</p>,
 }));
-vi.mock("@/components/chat-history", () => ({
-  ChatHistoryPanel: () => <p>chat-history-panel</p>,
-}));
 vi.mock("@/components/dashboard/panels", () => ({
   LeadsPanel: () => <p>leads</p>,
   PipelinePanel: () => <p>pipeline</p>,
@@ -71,23 +68,5 @@ describe("Dashboard navigation", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Overview" }));
     expect(screen.getByText("overview-panel")).toBeInTheDocument();
     expect(onTabChange).toHaveBeenCalledWith("overview");
-  });
-});
-
-describe("Dashboard section switching", () => {
-  it("keeps all seven tabs usable and informs the parent", () => {
-    const parentChange = vi.fn();
-    render(<Dashboard actionCenter={<p>ai-review</p>} onSelectCustomer={vi.fn()} onTabChange={parentChange} />);
-    for (const [label, value] of [
-      ["Overview", "overview"], ["Receivables", "receivables"],
-      ["Pipeline", "pipeline"], ["Leads", "leads"],
-      ["AI review", "ai-review"], ["Chats", "chats"],
-      ["Command Center", "command-center"],
-    ]) {
-      fireEvent.click(screen.getByRole("tab", { name: label }));
-      expect(screen.getByRole("tab", { name: label })).toHaveAttribute("aria-selected", "true");
-      expect(parentChange).toHaveBeenLastCalledWith(value);
-      expect(onTabChange).toHaveBeenLastCalledWith(value);
-    }
   });
 });

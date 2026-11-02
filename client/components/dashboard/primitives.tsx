@@ -1,74 +1,11 @@
 "use client";
 
-// Small presentational pieces the dashboard panels are built from. The KPI,
-// chart and attention pieces are the Overview's visual reference; the filter
-// and state notes are shared with the other tabs and keep their contract.
+// Small presentational pieces the dashboard panels are built from. Styling and
+// markup are the ones the dashboard has always rendered.
 
-import { useId, type ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
-import { ArrowUpRight, ChevronRight } from "lucide-react";
-import { cn } from "@/lib/utils";
-
-/**
- * A tiny, dependency-free sparkline. It only draws numbers the backend already
- * returned in the snapshot; it never invents or resamples a value.
- */
-function Sparkline({
-  values,
-  className,
-}: {
-  values: number[];
-  className?: string;
-}) {
-  const rawId = useId();
-  const gradientId = `spark-${rawId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
-  const series = values;
-  const width = 160;
-  const height = 32;
-  const max = Math.max(...series);
-  const min = Math.min(...series);
-  const span = max - min || 1;
-  const step = series.length > 1 ? width / (series.length - 1) : width;
-
-  const points = series.map((value, index) => {
-    const x = series.length > 1 ? index * step : width / 2;
-    const y = height - 3 - ((value - min) / span) * (height - 6);
-    return [x, y] as const;
-  });
-
-  const line = points.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
-  const area = `0,${height} ${line} ${width},${height}`;
-  const last = points[points.length - 1];
-
-  return (
-    <svg
-      viewBox={`0 0 ${width} ${height}`}
-      className={className}
-      aria-hidden="true"
-      focusable="false"
-    >
-      <defs>
-        <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.22" />
-          <stop offset="100%" stopColor="var(--accent)" stopOpacity="0" />
-        </linearGradient>
-      </defs>
-      <polygon points={area} fill={`url(#${gradientId})`} />
-      <polyline
-        points={line}
-        fill="none"
-        stroke="var(--accent)"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        vectorEffect="non-scaling-stroke"
-      />
-      {last && (
-        <circle cx={last[0]} cy={last[1]} r="2" fill="var(--accent)" />
-      )}
-    </svg>
-  );
-}
+import { ChevronRight } from "lucide-react";
+import type { ReactNode } from "react";
 
 export function KpiCard({
   icon: Icon,
@@ -76,59 +13,34 @@ export function KpiCard({
   value,
   detail,
   onActivate,
-  featured = false,
-  spark,
-  className,
 }: {
   icon: LucideIcon;
   label: string;
   value: string;
   detail: string;
   onActivate?: () => void;
-  featured?: boolean;
-  spark?: number[];
-  className?: string;
 }) {
   return (
-    <article
-      className={cn(
-        "kpi-card",
-        featured && "kpi-card--featured",
-        className
-      )}
-    >
+    <article className="group rounded-xl border border-border bg-surface p-5 shadow-sm transition-all duration-200 hover:border-border-hover hover:bg-surface-raised/40 hover:shadow-card">
       <div className="flex items-start justify-between gap-3">
-        <p className="kpi-label">{label}</p>
-        <span className="kpi-icon">
+        <p className="text-xs font-semibold uppercase tracking-wider text-muted">{label}</p>
+        <div className="grid h-7 w-7 place-items-center rounded-lg border border-border/60 bg-surface-raised text-muted transition-colors group-hover:border-accent/40 group-hover:text-foreground">
           <Icon size={14} aria-hidden="true" />
-        </span>
+        </div>
       </div>
-
       {onActivate ? (
         <button
           type="button"
           onClick={onActivate}
           title={`Open the ${label} tab`}
-          className="kpi-value block w-full rounded-sm p-0 text-left transition-colors hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+          className="mt-3 block text-left text-2xl font-bold font-mono tracking-tight text-foreground tabular-nums transition-colors hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
         >
           {value}
         </button>
       ) : (
-        <p className="kpi-value">{value}</p>
+        <p className="mt-3 text-2xl font-bold font-mono tracking-tight text-foreground tabular-nums">{value}</p>
       )}
-
-      <p className="kpi-detail">{detail}</p>
-
-      {onActivate && (
-        <button type="button" onClick={onActivate} className="kpi-action self-start rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40">
-          Open Leads
-          <ArrowUpRight size={12} aria-hidden="true" />
-        </button>
-      )}
-
-      {spark && spark.length > 1 && (
-        <Sparkline values={spark} className="kpi-spark" />
-      )}
+      <p className="mt-1 text-xs text-muted leading-relaxed">{detail}</p>
     </article>
   );
 }
@@ -136,26 +48,19 @@ export function KpiCard({
 export function ChartCard({
   title,
   subtitle,
-  action,
   children,
-  className,
 }: {
   title: string;
   subtitle: string;
-  action?: ReactNode;
   children: ReactNode;
-  className?: string;
 }) {
   return (
-    <section className={cn("chart-card", className)}>
-      <div className="chart-card-head">
-        <div className="min-w-0">
-          <h2 className="chart-card-title">{title}</h2>
-          <p className="chart-card-subtitle">{subtitle}</p>
-        </div>
-        {action}
+    <section className="min-w-0 overflow-hidden rounded-xl border border-border bg-surface p-5 shadow-sm transition-all duration-200 hover:border-border-hover hover:shadow-card">
+      <div>
+        <h2 className="text-sm font-semibold text-foreground tracking-tight">{title}</h2>
+        <p className="mt-0.5 text-xs text-muted">{subtitle}</p>
       </div>
-      <div className="mt-4 min-w-0">{children}</div>
+      <div className="mt-4">{children}</div>
     </section>
   );
 }
@@ -174,22 +79,22 @@ export function AttentionRow({
   onClick: () => void;
 }) {
   return (
-    <button type="button" onClick={onClick} className="attention-row group">
-      <span className="attention-row-main">
-        <span className="attention-row-label">{label}</span>
-        {detail && <span className="attention-row-detail">{detail}</span>}
-      </span>
-      <span className="attention-row-meta">
-        <span className="attention-row-count">
-          {count === undefined ? "Loading..." : `${count.toLocaleString("en-US")} items`}
-        </span>
-        {amount && <span className="attention-row-amount">{amount}</span>}
-        <ChevronRight
-          size={14}
-          className="attention-row-chevron"
-          aria-hidden="true"
-        />
-      </span>
+    <button
+      type="button"
+      onClick={onClick}
+      className="group flex w-full items-center justify-between gap-3.5 rounded-xl border border-border bg-surface-raised p-4 text-left transition-all duration-150 hover:border-accent/40 hover:bg-surface-overlay hover:shadow-sm"
+    >
+      <div className="min-w-0 flex-1">
+        <p className="text-sm font-semibold text-foreground transition-colors group-hover:text-accent">{label}</p>
+        <p className="mt-1 text-xs text-muted">
+          {count === undefined ? "Loading..." : `${count} items`}
+          {amount ? ` · ${amount}` : ""}
+        </p>
+        {detail && <p className="mt-1 text-[11px] text-muted/90">{detail}</p>}
+      </div>
+      <div className="grid h-7 w-7 shrink-0 place-items-center rounded-lg border border-border bg-surface text-muted transition-colors group-hover:border-accent/40 group-hover:text-accent">
+        <ChevronRight size={14} aria-hidden="true" />
+      </div>
     </button>
   );
 }
