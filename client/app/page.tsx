@@ -45,7 +45,7 @@ function HomeView() {
       />
 
       <Sheet open={isCustomerSheetOpen} onOpenChange={setIsCustomerSheetOpen}>
-        <main className="mx-auto w-full max-w-[1920px] px-4 xl:px-8 py-6 flex-1">
+        <main className="shell-container flex-1 py-5 sm:py-6">
           <div
             className={`grid transition-all duration-300 ease-in-out ${
               !showAssistantSidebar

@@ -23,13 +23,13 @@ export function BrandLogo({ className, showSubline = true }: BrandLogoProps) {
             height={36}
             priority
             onError={() => setHasError(true)}
-            className="h-8 w-auto object-contain"
+            className="h-7 w-auto object-contain sm:h-8"
           />
         </div>
       ) : (
         /* Honest fallback: only active if biztek-logo.png fails to load */
         <div className="flex items-center gap-2.5">
-          <div className="grid h-8 w-8 place-items-center rounded-lg bg-accent font-bold text-accent-foreground shadow-sm">
+          <div className="grid h-7 w-7 place-items-center rounded-lg bg-accent font-bold text-accent-foreground shadow-sm sm:h-8 sm:w-8">
             B
           </div>
           <p className="text-sm font-semibold tracking-wide text-foreground">
@@ -39,7 +39,7 @@ export function BrandLogo({ className, showSubline = true }: BrandLogoProps) {
       )}
 
       {showSubline && (
-        <div className="flex items-center gap-2.5">
+        <div className="hidden items-center gap-2.5 sm:flex">
           <span className="h-3.5 w-px bg-border" aria-hidden="true" />
           <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.22em] text-muted">
             Command Center
