@@ -13,14 +13,12 @@ function ChartCanvas({
   option,
   ariaLabel,
   dataTestId,
-  className = "h-56 w-full",
-  height,
+  className = "h-44 w-full",
 }: {
   option: echarts.EChartsOption;
   ariaLabel: string;
   dataTestId?: string;
   className?: string;
-  height?: number;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<echarts.ECharts | null>(null);
@@ -57,7 +55,6 @@ function ChartCanvas({
     <div
       ref={containerRef}
       className={`min-w-0 overflow-hidden ${className}`}
-      style={height === undefined ? undefined : { height }}
       role="img"
       aria-label={ariaLabel}
       data-testid={dataTestId}
@@ -73,7 +70,7 @@ function shortDate(date: string): string {
 export function RevenueTrendChart({ data }: { data: RevenuePerDay[] }) {
   const option = useMemo<echarts.EChartsOption>(
     () => ({
-      grid: { left: 0, right: 12, top: 16, bottom: 0, containLabel: true },
+      grid: { left: 44, right: 12, top: 16, bottom: 22, containLabel: false },
       tooltip: {
         trigger: "axis",
         backgroundColor: TOOLTIP_BG,
@@ -119,8 +116,7 @@ export function RevenueTrendChart({ data }: { data: RevenuePerDay[] }) {
           name: "Revenue",
           data: data.map((row) => row.total),
           smooth: true,
-          symbol: data.length === 1 ? "circle" : "none",
-          symbolSize: 6,
+          symbol: "none",
           lineStyle: { color: "#a3e635", width: 2.2 },
           areaStyle: {
             color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
@@ -146,7 +142,7 @@ export function RevenueTrendChart({ data }: { data: RevenuePerDay[] }) {
 export function QuoteVolumeChart({ data }: { data: QuotesPerDay[] }) {
   const option = useMemo<echarts.EChartsOption>(
     () => ({
-      grid: { left: 0, right: 12, top: 16, bottom: 0, containLabel: true },
+      grid: { left: 34, right: 12, top: 16, bottom: 22, containLabel: false },
       tooltip: {
         trigger: "axis",
         backgroundColor: TOOLTIP_BG,
@@ -205,7 +201,7 @@ export function QuoteVolumeChart({ data }: { data: QuotesPerDay[] }) {
 export function TopRepsChart({ reps }: { reps: RepMetric[] }) {
   const option = useMemo<echarts.EChartsOption>(
     () => ({
-      grid: { left: 0, right: 12, top: 6, bottom: 6, containLabel: true },
+      grid: { left: 96, right: 140, top: 6, bottom: 6, containLabel: false },
       tooltip: {
         trigger: "item",
         backgroundColor: TOOLTIP_BG,
@@ -241,6 +237,19 @@ export function TopRepsChart({ reps }: { reps: RepMetric[] }) {
             ]),
             borderRadius: [0, 4, 4, 0],
           },
+          label: {
+            show: true,
+            position: "right",
+            color: "#838e9f",
+            fontSize: 10,
+            fontFamily: "var(--font-mono)",
+            formatter: (params: unknown) => {
+              const first = params as { dataIndex?: number };
+              const rep = reps[first.dataIndex ?? 0];
+              if (!rep) return "";
+              return `${rep.total_display} · ${rep.count} ${rep.count === 1 ? "payment" : "payments"}`;
+            },
+          },
         },
       ],
     }),
@@ -248,22 +257,11 @@ export function TopRepsChart({ reps }: { reps: RepMetric[] }) {
   );
 
   return (
-    <div>
-      <ChartCanvas
-        option={option}
-        ariaLabel="Top sales reps by payments this month"
-        dataTestId="reps-chart"
-        className="w-full"
-        height={Math.max(208, reps.length * 36)}
-      />
-      <ul className="mt-3 divide-y divide-border border-t border-border" aria-label="Representative payment totals">
-        {reps.map((rep, index) => (
-          <li key={`${rep.rep_id}-${index}`} className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 py-2 text-xs">
-            <span className="min-w-0 break-words text-foreground">{rep.name}</span>
-            <span className="font-mono tabular-nums text-muted">{rep.total_display} · {rep.count} {rep.count === 1 ? "payment" : "payments"}</span>
-          </li>
-        ))}
-      </ul>
-    </div>
+    <ChartCanvas
+      option={option}
+      ariaLabel="Top sales reps by payments this month"
+      dataTestId="reps-chart"
+      className="h-52 w-full"
+    />
   );
 }

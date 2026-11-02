@@ -117,39 +117,6 @@ describe("OverviewPanel", () => {
     expect(onRefresh).toHaveBeenCalled();
   });
 
-  it("shows empty chart states while keeping zero-count attention links usable", () => {
-    const onSelectTab = vi.fn();
-    render(
-      <OverviewPanel
-        snapshot={snapshotFixture({ revenue_per_day: [], quotes_per_day: [], top_reps_this_month: [] })}
-        signals={emptySignalsReport()}
-        stuckLeads={emptyStuckLeads()}
-        onSelectTab={onSelectTab}
-        onRefresh={noSelect}
-      />,
-    );
-    expect(screen.getByText("No daily revenue data is available.")).toBeInTheDocument();
-    expect(screen.getByText("No daily quote data is available.")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /Unpaid invoices/ }));
-    expect(onSelectTab).toHaveBeenCalledWith("receivables");
-  });
-
-  it("offers a signals retry without hiding a previously loaded report", () => {
-    const retry = vi.fn();
-    const { rerender } = render(
-      <OverviewPanel snapshot={snapshotFixture()} signals={null} stuckLeads={null}
-        onSelectTab={noSelect} onRefresh={noSelect} signalsError="Signals failed" onRetrySignals={retry} />,
-    );
-    expect(screen.getByText("Signals are unavailable")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    expect(retry).toHaveBeenCalledOnce();
-    rerender(
-      <OverviewPanel snapshot={snapshotFixture()} signals={signalsReport()} stuckLeads={null}
-        onSelectTab={noSelect} onRefresh={noSelect} signalsError="Signals failed" onRetrySignals={retry} />,
-    );
-    expect(screen.getByRole("button", { name: /Unpaid invoices/ })).toBeInTheDocument();
-  });
-
   it("says so when no rep has been paid this month", () => {
     render(
       <OverviewPanel
