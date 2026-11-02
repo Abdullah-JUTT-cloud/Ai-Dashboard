@@ -440,6 +440,65 @@ async def test_cancelling_a_stream_records_task_cancelled():
 
 
 @pytest.mark.asyncio
+async def test_sse_stalled_turn_times_out_with_error_instead_of_hanging():
+    """Nov 2: a provider stream that never closes held the chat stream
+    open forever - the client showed "Working" and its follow-up queue
+    never drained, even though the answer text had arrived. A stalled
+    turn must end with an error event so the client settles it as failed
+    and the queue drains."""
+    import asyncio
+
+    from app.services.events import set_event_service
+
+    class RecordingEventService:
+        def __init__(self):
+            self.emitted = []
+
+        async def emit(self, **kwargs):
+            self.emitted.append(kwargs)
+            return None
+
+        async def last_status_by_agent(self, *_a, **_k):
+            return {}
+
+        async def get_events(self, *_a, **_k):
+            return []
+
+        async def recent_tasks(self, *_a, **_k):
+            return []
+
+        async def task_exists(self, *_a, **_k):
+            return False
+
+        async def ensure_indexes(self):
+            return None
+
+    set_event_service(RecordingEventService())
+    try:
+        db = FakeDatabase(
+            chat_threads=FakeCollection(),
+            chat_logs=FakeCollection(),
+        )
+        gate = asyncio.Event()  # never set: the model stalls after one chunk
+        model = FakeStreamingModel(["The dashboard "], gate)
+        stream = stream_chat(
+            "thread-stall", "status?", db, model=model, tools=[], turn_timeout=0.3,
+        )
+
+        async def drain():
+            return [event async for event in stream]
+
+        events = await asyncio.wait_for(drain(), timeout=5)
+        names = [event["event"] for event in events]
+        assert names[0] == "task"
+        assert "token" in names
+        assert "done" not in names
+        assert names[-1] == "error"
+    finally:
+        set_event_service(None)
+
+
+@pytest.mark.asyncio
 async def test_sse_events_order_tool_then_tokens_then_done():
     async def read_tool(database=None):
         return {"count": 4}
