@@ -61,21 +61,20 @@ HOW TO WORK
    two exact matches in the same system disagree. Never print a numeric
    customer id or a record_id hex in an answer: refer to people by name and
    company, and to records by type ("the Lead", "the Contact").
-   PAYMENTS LIVE IN TWO LEDGERS. get_payments reads the ERP; get_crm_payments
-   reads the Zoho CRM, which mirrors ERP payments (its rows carry the ERP id)
-   and also holds payments the ERP list does not show. For any question about
-   payments received - today, this week, from a customer - call
-   get_payments_both_ledgers FIRST: one call returns both ledgers with
-   Python totals kept separate, so a ledger can never be skipped (live
-   Oct 27: Canyon Plastics answered from the ERP alone twice). Report
-   each ledger under its own label with its own total: never merge
-   them into one figure, and never answer "no payments" from one ledger
-   alone. Use the single-ledger tools only when the user names one
-   ledger explicitly. A CRM receive date is a calendar date with no clock time - if the
-   user asks for an exact time, say the CRM records the date only (its
-   record_created_at is the sync time, shown in the system timezone in
-   24-hour format, not when the money arrived). For a
-   person's payments or orders, resolve their company with find_customer
+   PAYMENTS, INVOICES AND QUOTES COME FROM THE ERP ONLY. get_payments
+   reads the ERP ledger; get_invoices and get_quotes read the ERP
+   mirrors. For any question about payments received, invoices owed or
+   quotes open - today, this week, this month, last month, or from a
+   customer - use those tools: a named period resolves on the ERP
+   business calendar, the same day the revenue tile reports, and a
+   customer with no period scans all time. The CRM (get_customer360,
+   search_customer360) is for a record's identity, timeline and
+   conversation only: never answer a payments, invoices or quotes
+   question from a CRM record's invoices, estimates or payments
+   sections, and never compare an ERP figure against a CRM one - the
+   CRM mirrors ERP data, so a comparison double-counts and confuses.
+   Report the ERP total first, then the rows.
+   For a person's payments or orders, resolve their company with find_customer
    first and query by the company name as well as the person's name -
    records are filed under the company.
    CRM ANALYSIS. When the user names a CRM record and explicitly asks for
@@ -2570,15 +2569,23 @@ async def stream_chat(
     model: Any = None,
     tools: list | None = None,
     task_id: str | None = None,
+    turn_timeout: float | None = None,
 ):
     """Yield tool progress, answer text chunks, and the final SSE payload.
 
     The response format is unchanged; the turn's task id is persisted
     server-side (in the stored turn and chat log) so the command center can
     later link an answer to the real tool events behind it.
+
+    The turn is bounded: a provider stream that never closes, or a hung
+    await in the turn's tail, used to hold this stream open forever, and
+    the client shows "Working" with a follow-up queue that never drains
+    until the stream ends. On timeout the stream ends with an error event
+    instead, so the client settles the turn as failed and the queue drains.
     """
     queue: asyncio.Queue = asyncio.Queue()
     task_id = task_id or uuid.uuid4().hex
+    timeout = turn_timeout if turn_timeout is not None else settings.CHAT_TURN_TIMEOUT_SECONDS
 
     async def worker() -> None:
         try:
@@ -2589,14 +2596,17 @@ async def stream_chat(
             await queue.put(
                 {"event": "task", "data": {"task_id": task_id, "thread_id": thread_id}}
             )
-            outcome = await run_chat(
-                thread_id,
-                message,
-                database=database,
-                model=model,
-                tools=tools,
-                events=queue,
-                task_id=task_id,
+            outcome = await asyncio.wait_for(
+                run_chat(
+                    thread_id,
+                    message,
+                    database=database,
+                    model=model,
+                    tools=tools,
+                    events=queue,
+                    task_id=task_id,
+                ),
+                timeout=timeout,
             )
             # Real streaming already sent deltas. Only models without astream
             # (tests, unusual providers) need the post-hoc chunk fallback.
@@ -2612,6 +2622,15 @@ async def stream_chat(
                         "task_id": task_id,
                     },
                 }
+            )
+        except asyncio.TimeoutError:
+            # A stalled turn must end as a visible error, never as an endless
+            # stream: the client settles the turn as failed and drains its
+            # follow-up queue. No task event is awaited here - the emit path
+            # itself may be what stalled, so awaiting it could hang again.
+            log.warning("chat turn %s timed out after %ss", task_id, timeout)
+            await queue.put(
+                {"event": "error", "data": {"message": "This request took too long. Please try again."}}
             )
         except asyncio.CancelledError:
             # A dead stream (page reload, Stop) cancels the turn. That must
