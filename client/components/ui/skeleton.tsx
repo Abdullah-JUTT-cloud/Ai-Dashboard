@@ -34,7 +34,7 @@ function SkeletonKpiTile({ className }: { className?: string }) {
         <Skeleton className="h-4 w-4 rounded-full" />
       </div>
       <Skeleton className="h-8 w-36 font-mono" />
-      <Skeleton className="h-3 w-44" />
+      <Skeleton className="h-3 w-44 max-w-full" />
     </div>
   );
 }

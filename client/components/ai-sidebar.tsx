@@ -16,7 +16,7 @@ export function AISidebar({
 }) {
   if (!isOpen) {
     return (
-      <aside className="sticky top-0 flex h-screen justify-center border-l border-border bg-background py-4">
+      <aside className="sticky top-0 flex h-screen justify-center border-l border-border bg-background py-4 xl:top-16 xl:h-[calc(100vh-4rem)]">
         <button
           type="button"
           onClick={onOpen}
@@ -30,15 +30,15 @@ export function AISidebar({
   }
 
   return (
-    <aside className="sticky top-0 flex h-screen min-h-0 flex-col overflow-hidden border-l border-border bg-background">
-      <header className="flex shrink-0 items-center justify-between border-b border-border px-5 py-4">
+    <aside className="sticky top-0 flex h-screen min-h-0 flex-col overflow-hidden border-l border-border bg-background xl:top-16 xl:h-[calc(100vh-4rem)]">
+      <header className="flex shrink-0 items-center justify-between border-b border-border px-4 py-3.5">
         <div className="flex items-center gap-3">
-          <span className="grid h-9 w-9 place-items-center rounded-xl bg-accent/10 text-accent">
-            <Bot size={18} aria-hidden="true" />
+          <span className="grid h-9 w-9 place-items-center rounded-xl border border-accent-border bg-accent-muted text-accent">
+            <Bot size={17} aria-hidden="true" />
           </span>
           <div>
-            <h2 className="text-sm font-semibold">Biztek Assistant</h2>
-            <p className="mt-0.5 text-xs text-muted">AI command center</p>
+            <h2 className="text-[13px] font-semibold tracking-tight text-foreground">Biztek Assistant</h2>
+            <p className="mt-0.5 text-[11px] text-muted">AI command center</p>
           </div>
         </div>
         <button
@@ -55,7 +55,7 @@ export function AISidebar({
         defaultValue="text-chat"
         className="min-h-0 flex-1 gap-0"
       >
-        <TabsList aria-label="AI modes" className="mx-4 mt-4 w-auto">
+        <TabsList aria-label="AI modes" className="mx-3 mt-3 w-auto">
           <TabsTrigger value="text-chat" className="flex-1 gap-2">
             <MessageSquareText size={15} aria-hidden="true" />
             Text Chat
