@@ -57,6 +57,14 @@ class Settings(BaseSettings):
     # one can take over a minute, so reads get a long timeout and every
     # detail payload is cached in Mongo for this many minutes.
     C360_TIMEOUT_SECONDS: float = 120.0
+    # A chat turn that stalls - a provider stream that never closes, a hung
+    # database/Redis await in the turn's tail - must never hold the chat
+    # stream open forever: the client shows "Working" and never drains its
+    # follow-up queue until the stream ends. This caps the whole turn;
+    # 600s is far above any legitimate turn (cold CRM reads take ~120s),
+    # so it only ever fires on a genuine stall, which then ends as a
+    # visible error instead of an endless spinner.
+    CHAT_TURN_TIMEOUT_SECONDS: float = 600.0
     C360_CACHE_MINUTES: int = 30
     # The mirror sync (customer360_sync) runs automatically inside the
     # server: when the last completed sync is older than this, the
