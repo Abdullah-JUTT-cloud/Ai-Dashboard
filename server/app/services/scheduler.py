@@ -139,6 +139,7 @@ class DashboardScheduler:
         self._interval = interval_seconds
         self._task: Optional[asyncio.Task] = None
         self._c360_task: Optional[asyncio.Task] = None
+        self._whatsapp_task: Optional[asyncio.Task] = None
         self._stop: Optional[asyncio.Event] = None
         self._last_daily_day: Optional[str] = None  # e.g. "2026-10-20"
         # this process' identity in the leader election
@@ -231,6 +232,7 @@ class DashboardScheduler:
         self._stop = asyncio.Event()
         self._task = asyncio.create_task(self._loop(), name="dashboard-scheduler")
         self._c360_task = asyncio.create_task(self._c360_loop(), name="c360-auto-sync")
+        self._whatsapp_task = asyncio.create_task(self._whatsapp_loop(), name="whatsapp-index-sync")
 
     async def stop(self) -> None:
         if self._stop is not None:
@@ -245,6 +247,11 @@ class DashboardScheduler:
             with suppress(asyncio.CancelledError):
                 await self._c360_task
             self._c360_task = None
+        if self._whatsapp_task is not None:
+            self._whatsapp_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._whatsapp_task
+            self._whatsapp_task = None
         await self.step_down()
 
     # ---------------------------------------------- job: c360 auto-sync
@@ -323,6 +330,68 @@ class DashboardScheduler:
                 raise
             except Exception:  # a bad check must never kill the loop
                 log.exception("c360 auto-sync check failed")
+
+    # ---------------------------------------------- job: whatsapp index
+
+    async def _job_whatsapp_sync(self, now: Optional[datetime] = None) -> dict:
+        """Launch one WhatsApp index pass on its OWN cadence. Never raises.
+
+        Separate from the c360 mirror sync and the 5-minute signal cycle by
+        design: this pass makes per-person detail calls and must never hold
+        either of their locks or slow either of their loops. The subprocess
+        carries its own Redis lock, so passes can never overlap."""
+        now = now or datetime.now(timezone.utc)
+        if not settings.WHATSAPP_SYNC_ENABLED:
+            return {"ok": True, "skipped": "disabled"}
+        if not settings.C360_EMAIL or not settings.C360_PASSWORD:
+            return {"ok": True, "skipped": "unconfigured"}
+        runs = self._db().customer360_whatsapp_runs
+        try:
+            last = await runs.find_one({}, sort=[("started_at", -1)])
+        except Exception:
+            log.exception("could not read the last whatsapp index run")
+            return {"ok": False, "error": "run-log-unreadable"}
+        last_started = _c360_started_at(last) if last else None
+        if last_started is not None:
+            age_minutes = (now - last_started).total_seconds() / 60.0
+            if age_minutes < float(settings.WHATSAPP_SYNC_MINUTES):
+                return {"ok": True, "skipped": "not-due"}
+        try:
+            runner = Path(__file__).resolve().parents[2] / "run_whatsapp_index.py"
+            log.info("whatsapp index: launching a sync pass")
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, str(runner), "--auto", cwd=str(runner.parent)
+            )
+            code = await proc.wait()
+            log.info("whatsapp index: runner exited with code %s", code)
+            return {"ok": code == 0, "exit_code": code, "scope": "whatsapp"}
+        except Exception:
+            log.exception("whatsapp index failed to launch")
+            return {"ok": False, "error": "launch-failed"}
+
+    async def _whatsapp_loop(self) -> None:
+        """Check for a due WhatsApp index pass on its own cadence.
+
+        The first check waits two minutes so a restart never competes with
+        startup work; between passes the loop sleeps the configured minutes -
+        it never shares the signal cycle's timer."""
+        nap = 120.0
+        while self._stop is not None and not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=nap)
+                return
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+            nap = max(300.0, float(settings.WHATSAPP_SYNC_MINUTES) * 60.0)
+            try:
+                if await self.claim_leadership():
+                    await self._job_whatsapp_sync()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # a bad pass must never kill the loop
+                log.exception("whatsapp index check failed")
 
     async def _loop(self) -> None:
         loop = asyncio.get_running_loop()

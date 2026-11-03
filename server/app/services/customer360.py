@@ -181,13 +181,16 @@ def _conversation(ordered: list[dict]) -> list[dict]:
     content and the duration/transcript in metadata."""
     out: list[dict] = []
     for row in ordered[:12]:
-        content = str(row.get("content") or "").strip()
+        # email bodies arrive as raw HTML: readable_text strips tags and
+        # decodes entities BEFORE the 600-char cut, so a bounded body is
+        # always readable words, never a mid-tag fragment
+        content = processors.readable_text(row.get("content"), 600)
         entry: dict[str, Any] = {
             "type": row.get("type"),
             "direction": row.get("direction"),
             "at": row.get("timestamp") or row.get("createdAt"),
             "title": str(row.get("title"))[:120] if row.get("title") is not None else None,
-            "content": content[:600] if content else None,
+            "content": content or None,
         }
         if row.get("type") == "Call":
             meta = _metadata(row)

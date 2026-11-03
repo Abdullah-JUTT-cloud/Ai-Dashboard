@@ -8,7 +8,7 @@ import logging
 import re
 import time as monotonic_time
 import uuid
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, TypedDict
 from zoneinfo import ZoneInfo
 
@@ -33,6 +33,7 @@ from app.config import settings
 from app.services import periods
 from app.services.events import get_event_service
 from app.services.processors import ERP_TZ
+from app.services.crm_digest import format_human_timestamp
 
 log = logging.getLogger("chat_agent")
 MAX_TOOL_CALLS = 12     # per question, shared by parallel calls
@@ -58,7 +59,11 @@ HOW TO WORK
    full-name match IS the person asked for; partial matches (Amber Frank for
    "Frank Jr") are different people - never present them as choices for the
    same name, and never block the answer on them. Ask a question only when
-   two exact matches in the same system disagree. Never print a numeric
+   two exact matches in the same system disagree. When one search returns two
+   exact matches of different record types (the Lead and the Contact), they
+   are two records of the one person asked for: never ask "Lead or Contact?" -
+   answer about both, and when an analysis was asked for, run it for both.
+   Never print a numeric
    customer id or a record_id hex in an answer: refer to people by name and
    company, and to records by type ("the Lead", "the Contact").
    PAYMENTS, INVOICES AND QUOTES COME FROM THE ERP ONLY. get_payments
@@ -73,24 +78,60 @@ HOW TO WORK
    question from a CRM record's invoices, estimates or payments
    sections, and never compare an ERP figure against a CRM one - the
    CRM mirrors ERP data, so a comparison double-counts and confuses.
+   This holds even when the question names the CRM ("Show me X's CRM
+   payments"): there is one ledger - answer it from the ERP tools and
+   show no CRM figure. If a CRM lookup was attempted and failed or
+   timed out, still call get_payments / get_invoices / get_quotes and
+   report the ERP total: never end such a question with a choice
+   between retrying the CRM and pulling the ERP, and never end it with
+   a question and no figure.
    Report the ERP total first, then the rows.
    For a person's payments or orders, resolve their company with find_customer
    first and query by the company name as well as the person's name -
    records are filed under the company.
+   INVOICE DETAIL VIEW. When viewing details of an invoice (via get_record on invoices or orders), format the invoice date as a human-readable timestamp (using invoice_date_human such as 'Oct 3, 2026, 3:53 AM UTC-05:00'). If the invoice has days_overdue_label, display that boundary label (e.g. '0 days past 30-day terms (due today / first day overdue)').
    CRM ANALYSIS. When the user names a CRM record and explicitly asks for
    its analysis, call get_customer360_analysis and present its output
    labeled as the CRM AI's analysis, email draft included; if its
    ai_status is not "Verified", say plainly that the CRM returned a
-   placeholder. Never fetch an analysis the user did not ask for.
+   placeholder. When the search found two exact matches for the person -
+   the Lead and the Contact - call get_customer360_analyses ONCE with both
+   records and present BOTH analyses in one answer; do not ask the user to
+   choose a record. Never fetch an analysis the user did not ask for.
    FOLLOW-UP QUEUE. When the user asks who is waiting for a reply -
    overall, or on WhatsApp in particular - call get_crm_follow_up_queue
    and report the queue it returns: each customer's channel, how long
-   they have waited, and their last message. Date the answer with the
-   result's as_of instead of implying it is live.
+   they have waited, and their last message. The queue answers "who is
+   waiting", never "what messages exist" - a request for messages is
+   answered under MESSAGES ACROSS ALL CONTACTS, not from this tool.
+   Date the answer with the result's as_of_human (e.g. 'Nov 2, 2026, 9:54 PM UTC')
+   instead of raw microsecond timestamps or implying it is live. When the queue is 0
+   and previous_run_waiting is present in the result, include the explanation:
+   "No one waiting in the latest run (previous run had {previous_run_waiting} waiting)."
+   When the result says
+   available=false (reason no_finished_run) there is no queue to report
+   and zero is NOT an honest answer: say plainly "No finished agent run
+   yet - the queue needs a run first. Start one from the Run agents
+   button (or wait for the 6 AM daily run)." and state no waiting count.
+   Never offer a CSV file or downloadable export for the follow-up queue; the queue is an operational triage view.
    MORNING BRIEFING. When the user asks for the morning briefing or
    what happened yesterday, call get_crm_morning_briefing and present
-   its three blocks: yesterday's CRM payments with their total, who is
-   waiting for a reply, and the biggest stalled deals.
+   its three blocks. Every dated block must state its explicit calendar date
+   (e.g. "CRM payments for 2026-11-01") alongside or instead of relative
+   words ("yesterday"); never rely on an unanchored relative word whose
+   reference frame (run date vs chat date) is ambiguous. If using a relative
+   word, anchor it to the run date (e.g. "yesterday relative to the run date 2026-11-02").
+   Date the briefing with as_of_run_human (e.g. 'Nov 2, 2026, 8:06 PM UTC'), never raw microsecond timestamps.
+   Present:
+   1) CRM payments for that explicit calendar date with their total;
+   2) who is waiting for a reply;
+   3) the biggest stalled deals.
+   Each block carries a status - present, empty, or unavailable. Present a partial
+   briefing honestly: give the figures of the present blocks, and name
+   the block that is unavailable and why; a block from a missing run is
+   never zero, it is unavailable. With no finished run at all say: "No
+   finished agent run yet - the briefing needs a run first. Start one
+   from the Run agents button (or wait for the 6 AM daily run)."
    EMPTY FIELDS. Never print an empty field, the word null, or a raw
    placeholder such as "(null)" in an answer: leave the line out, or say
    in plain words that the record has none (for example, that the CRM
@@ -108,6 +149,67 @@ HOW TO WORK
    When the user asks for the latest or taaza data of a record, call
    get_customer360 with fresh=true: the saved copy is skipped and the
    record is re-fetched live from the CRM.
+   MESSAGES ACROSS ALL CONTACTS. WhatsApp, SMS and email message bodies
+   live in the CRM per record; the cross-contact view is the local
+   WhatsApp index. "Fetch/show all latest WhatsApp messages" -> call
+   get_whatsapp_latest_messages; "who has more/most WhatsApp messages",
+   "rank by message count" -> call get_whatsapp_top_contacts. Both read
+   Mongo only, and the answer must carry the tool's coverage line
+   ("Indexed N of M person records, as of T") - never present index data
+   as live CRM data, and never claim the list is complete when the
+   coverage says the index is partial. When reporting WhatsApp contact rankings from
+   get_whatsapp_top_contacts, if a contact's inbound + outbound breakdown does not
+   equal the total message count (e.g. breakdown unavailable), display '—' for inbound
+   and outbound rather than showing inconsistent numbers. The follow-up queue is NOT a
+   message source: it answers "who is waiting for a reply" only, and its
+   rows, channels or counts must never be cited as messages. One
+   person's full thread still goes through search_customer360 then
+   get_customer360. If the user names an entity the CRM does not hold
+   (for example "patients"), say so in one line - the CRM tracks Leads,
+   Contacts and Customers - and answer with those real record types.
+   Never invent a message or a count: every figure comes from the index
+   tools' own rows.
+   CSV FILE EXPORT. When the user asks for CSV ("give me this as CSV",
+   "CSV mein do", "export this as CSV", "give me CSV of ..."), produce an
+   actual downloadable CSV file:
+   1) State clearly how many rows the file contains (e.g. "I have generated
+      a CSV file with 1 row." or "with 26 rows."). Pluralization rule: use '1 row'
+      (never '1 rows'). For a full-list export, include all matched
+      rows from the query, not just the displayed page.
+   2) Provide a download link with a meaningful filename derived from the
+      query and date: [Download <filename>.csv](#download:<filename>.csv)
+      (for example [Download whatsapp-latest-2026-11-03.csv](#download:whatsapp-latest-2026-11-03.csv)
+      or [Download treatday-payments.csv](#download:treatday-payments.csv)).
+   3) Provide the full CSV content inside a ```csv code block with proper
+      column headers (e.g. Name, Record Type, Company, Direction, Time, Message).
+   4) Strict company attribution: Each row's company must come strictly from
+      that record, never copied from another row of the same person.
+   5) OFFER ONLY WHAT EXISTS: File/download/view wording is allowed ONLY
+      when the answer carries this real downloadable file link. When offering
+      CSV in prose without a file link, never promise a file, a download or an attachment
+      — state plainly "I can print it as CSV text here in chat" and never use
+      file, download, or attachment words.
+   COMPANY ATTRIBUTION IN LISTS AND CSV. Each row's company must come strictly
+   from that row's own record in the index doc. If an index record has no company
+   (or null/empty), it has NO company: in a list, do not state a company for it;
+   in CSV text, the Company column for that row MUST be empty ("") - NEVER copy
+   a company from a neighbouring row or another record of the same person. Both
+   list and CSV renderings must show the same company status for the same record.
+   NEVER-MESSAGED QUESTIONS. When asked for customers/contacts/leads who have NEVER
+   had a WhatsApp message (or zero messages), explain honestly that the WhatsApp index
+   only indexes records with messages and is partial (state the coverage line).
+   A live CRM sweep for never-messaged is infeasible (requires ~30,000 detail calls)
+   and MUST NEVER BE OFFERED. The ONLY allowed options to offer the user:
+   (a) page the indexed people who have messages,
+   (b) print the indexed latest-message list as CSV text here in chat so you can compare offline with your customer list,
+   (c) run a full re-index via the runner (server/run_whatsapp_index.py --full) to complete the index.
+   Never offer a live CRM check or sweep for unmessaged contacts.
+   PAGINATION HONESTY. A continuation keeps the PREVIOUS page's limit; never call a listing tool to fill space.
+   You must NEVER assert "more records are on later pages" or
+   "more can be fetched" unless the current listing's tool result explicitly has has_more=true.
+   When has_more is false or all records have been returned, the listing is complete:
+   say so plainly. If the user asks for the next page of an already-complete listing,
+   answer that all records were already shown and there is no next page.
    ADVICE. When the user asks what to do with a lead or how to turn it
    into an order, the answer has ONE shape. Lead with the single blocker:
    the field the tool result says is missing, named exactly - it is the
@@ -127,7 +229,11 @@ HOW TO WORK
    single next step you need the user to confirm. When the lead tool
    gives a next_action, that IS the question - copy it word for word;
    never offer to contact the customer yourself, because drafts are
-   for a human only and nothing is ever sent to a customer.
+   for a human only and nothing is ever sent to a customer. A draft
+   addresses the person by the name the record holds - never by a
+   placeholder token such as {Name} - and names only values the record
+   holds: never write example values (e.g. foil/film/paper, e.g.
+   gloss/matte) for a field the record is missing.
 2. Tool choice: get_dashboard_metrics for headline KPIs (today's revenue, month
    to date, last 7 days, open quotes, unpaid and overdue totals) - those strings
    are the same ones the dashboard tiles show, copy them exactly. get_payments /
@@ -155,9 +261,18 @@ total_count, returned, remaining_count, has_more, next_offset.
 - Report those numbers as the tool wrote them. "34 payments match, 29 are listed
   here and 5 remain" is a supported answer whenever those three numbers come
   from the page block - use it instead of apologising.
+- pages_total divides total_count by page_size - the rows a page really
+  carried - not by limit. The context budget can trim a page below the limit
+  it asked for (page_shorter_than_requested): then state the page as the
+  effective size the tool reports (for example "26 shown of 202", page 1 of
+  8) and never quote limit next to pages_total, because the two disagree.
 - When the user asks for all of them, "show all", "the rest", "yes" to fetching
   more, or the next batch: call the SAME tool again with the SAME filters and
   offset set to the previous next_offset, and keep going until has_more is false.
+  A continuation keeps the PREVIOUS page's limit: never re-choose a page size,
+  or the same listing reads "page 1 of 1" on one turn and "page 2 of 3" on the
+  next. When the recorded listing was already complete, say so - there is no
+  next page; do not invent one by shrinking the limit.
   Never change the filters or the date range while continuing a page.
 - When a question needs several sources (a customer 360, a comparison, a
   'why' question), call the tools together in one block instead of one per
@@ -220,6 +335,8 @@ re-list every amount.
 If no due date is recorded, say "Unconfirmed, because no due date is recorded"
 once, and do not claim that caused the nonpayment. overdue=false is an age flag,
 not proof of terms.
+OVERDUE INVOICE TERMS. Invoices exceeding 30-day terms are overdue. For an invoice with
+0 days overdue, clarify it as: '0 days past 30-day terms (due today / first day overdue)'.
 
 LANGUAGE. Match the user's language and script: English stays English, Urdu
 script stays Urdu script, Roman Urdu stays wholly Roman Urdu - translate
@@ -294,6 +411,11 @@ _OTHER_CURRENCY_RE = re.compile(
 _DATE_STRING_RE = re.compile(
     r"(?<![\d/\-])\d{4}-\d{2}(?:-\d{2})?(?:[T ]\d{2}:\d{2}(?::\d{2})?)?(?!\d)"
     r"|(?<![\d/\-])\d{1,2}/\d{1,2}/\d{2,4}(?![\d/])"
+)
+# Human-readable dates like "Nov 2, 2026, 7:03 PM UTC" or "October 3, 2026, 3:53 AM UTC-05:00"
+_HUMAN_DATE_RE = re.compile(
+    r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}(?:,\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?(?:\s+[A-Z0-9_+-]+)?)?",
+    re.I,
 )
 # rounded money: "$147k", "$2.4M"
 _SUFFIXED_MONEY_RE = re.compile(r"\$\s*([\d][\d,]*(?:\.\d+)?)\s*([kKmM])(?![\w])")
@@ -419,6 +541,10 @@ def _harvest(node: Any, facts: set[float], identifiers: set[float], dates: set[s
         dates.add(chunk)
         if re.match(r"\d{4}-", chunk):
             facts.add(float(chunk[:4]))
+    for match in _HUMAN_DATE_RE.finditer(text):
+        m_year = re.search(r"\b(20\d{2})\b", match.group(0))
+        if m_year:
+            facts.add(float(m_year.group(1)))
     if _ID_KEY_RE.search(key_hint):
         for run in re.findall(r"\d+(?:,\d{3})*(?:\.\d+)?", text):
             identifiers.add(float(run.replace(",", "")))
@@ -427,6 +553,7 @@ def _harvest(node: Any, facts: set[float], identifiers: set[float], dates: set[s
         facts.add(float(text.strip().replace(",", "")))
         return
     stripped = _DATE_STRING_RE.sub(" ", text)
+    stripped = _HUMAN_DATE_RE.sub(" ", stripped)
     # '27608-2025-10' is one ERP reference: it belongs to the id bucket, and its
     # month part must not become a count a claim can borrow
     for chunk in _REFERENCE_TOKEN_RE.findall(stripped):
@@ -453,6 +580,7 @@ def _verbatim_strings(node: Any, out: list[str]) -> None:
     elif isinstance(node, str):
         text = normalize_digits(node)
         text = _DATE_STRING_RE.sub(" ", text)
+        text = _HUMAN_DATE_RE.sub(" ", text)
         text = _REFERENCE_TOKEN_RE.sub(" ", text)
         # Commas and whitespace become one gap, never nothing: '25,000' and
         # '25 000' still compare equal to '25000', while the boundary between
@@ -585,6 +713,15 @@ def validate_numeric_claims(
         if not any(written == known or known.startswith(written) for known in canonical_dates):
             errors.append(f"unsupported date {match.group(0)}")
     scanned = _mask(scanned, date_spans)
+
+    # 1a) human-readable dates like "Nov 2, 2026, 7:03 PM UTC" or "October 3, 2026, 3:53 AM UTC-05:00"
+    human_date_spans = []
+    for match in _HUMAN_DATE_RE.finditer(scanned):
+        m_year = re.search(r"\b(20\d{2})\b", match.group(0))
+        if m_year and float(m_year.group(1)) not in facts and float(m_year.group(1)) not in restated:
+            errors.append(f"unsupported date {match.group(0)}")
+        human_date_spans.append((match.start(), match.end()))
+    scanned = _mask(scanned, human_date_spans)
 
     # 0) then a whole ERP reference such as "33563-2026-10": one identifier, so
     # only its leading number has to be real
@@ -825,6 +962,8 @@ _EVIDENCE_NOUNS = {
     "get_invoices": "invoices", "get_top_unpaid": "invoices", "get_customer_context": "invoices",
     "get_quotes": "quotes", "get_top_open_quotes": "quotes",
     "get_orders": "orders", "get_leads": "leads", "get_stuck_leads": "leads",
+    "get_whatsapp_latest_messages": "messages", "get_whatsapp_top_contacts": "contacts",
+    "get_crm_follow_up_queue": "customers waiting",
 }
 
 # The human words for a period the backend resolved. The answer formatter uses
@@ -868,10 +1007,358 @@ _DISPLAY_CLAIM_RE = re.compile(
     r"displayed\s+here|listed\s+here|listed\s+above|below|above|included|here)\b",
     re.I,
 )
+# Live Nov 2: a stuck-lead answer shipped a draft "Hi {Name}, ..." - an
+# unfilled template token is never addressed to anybody, so no answer may
+# carry one. The shape is a brace-wrapped word, not ordinary prose.
+_UNFILLED_PLACEHOLDER_RE = re.compile(r"\{\s*[A-Za-z][A-Za-z0-9_ ]{0,40}\s*\}")
+# ... and the same answer suggested specs "material (e.g. foil/film/paper)"
+# and "finish (e.g. gloss, matte)" for fields the record does not hold. A
+# missing spec is a question to the customer, so an "e.g." list of candidate
+# spec values is an invention; spec values the records really hold stay legal.
+_EXAMPLE_CUE_RE = re.compile(r"\be\.\ ?g\.?\b|\bfor example\b", re.I)
+_SPEC_VALUE_RE = re.compile(
+    r"\b(foils?|vinyl|films?|papers?|mylar|matte|gloss|laminat\w+|poly\w+)\b", re.I
+)
 
 
 def _period_phrase(named_period: str | None) -> str | None:
     return _PERIOD_PHRASES.get(named_period) if named_period else None
+
+
+_BLOCK_SPLIT_RE = re.compile(
+    r"(?:\n\s*\n|\n(?=\s*(?:[0-9]+[.)]|[-*#]))|\s+/\s+(?=[0-9]+[.)]))"
+)
+_PERIOD_PHRASES_SORTED = sorted(set(_PERIOD_PHRASES.values()), key=len, reverse=True)
+
+
+def _extract_dated_tool_blocks(tool_results: list[dict]) -> list[dict]:
+    """Dated blocks in this turn's evidence that establish their own reference frame.
+
+    A morning briefing / CRM digest carries yesterday's CRM payments as of an agent
+    run date. When the user asks 'What is today's briefing?', the turn's resolved range
+    is 'today', but the digest's payments block is for that block's explicit calendar date.
+    Judging the block against that date (and accepting explicit date labels) avoids
+    falsely rejecting the briefing while preserving strict checks against genuine contradictions.
+    """
+    blocks: list[dict] = []
+    for entry in tool_results:
+        if not isinstance(entry, dict):
+            continue
+        tool = entry.get("tool")
+        res = entry.get("result")
+        if not isinstance(res, dict):
+            continue
+        if tool == "get_crm_morning_briefing" or res.get("source") == "crm_morning_briefing":
+            payments = res.get("payments") if isinstance(res.get("payments"), dict) else {}
+            block_date = str(payments.get("date") or res.get("date") or "")
+            as_of_run = res.get("as_of_run")
+            run_date = str(as_of_run)[:10] if as_of_run else None
+            allowed_relative: set[str] = set()
+            if block_date:
+                try:
+                    d_block = date.fromisoformat(block_date)
+                    ref_dates: list[date] = []
+                    if run_date:
+                        try:
+                            ref_dates.append(date.fromisoformat(run_date))
+                        except Exception:
+                            pass
+                    try:
+                        from app.services import periods
+                        ref_dates.append(periods.business_today())
+                    except Exception:
+                        pass
+                    for ref_d in ref_dates:
+                        diff = (ref_d - d_block).days
+                        if diff == 0:
+                            allowed_relative.add("today")
+                        elif diff == 1:
+                            allowed_relative.add("yesterday")
+                        if 0 <= diff <= 7:
+                            allowed_relative.add("the last 7 days")
+                        if 0 <= diff <= 30:
+                            allowed_relative.add("the last 30 days")
+                        if 0 <= diff <= 90:
+                            allowed_relative.add("the last 90 days")
+                        if d_block.year == ref_d.year:
+                            allowed_relative.add("this year")
+                            if d_block.month == ref_d.month:
+                                allowed_relative.add("this month")
+                                allowed_relative.add("this month so far")
+                            elif ref_d.month - d_block.month == 1:
+                                allowed_relative.add("last month")
+                            d_block_iso = d_block.isocalendar()
+                            ref_iso = ref_d.isocalendar()
+                            if d_block_iso[1] == ref_iso[1]:
+                                allowed_relative.add("this week")
+                                allowed_relative.add("this week so far")
+                            elif ref_iso[1] - d_block_iso[1] == 1:
+                                allowed_relative.add("last week")
+                        elif ref_d.year - d_block.year == 1:
+                            allowed_relative.add("last year")
+                            if ref_d.month == 1 and d_block.month == 12:
+                                allowed_relative.add("last month")
+                except Exception:
+                    pass
+            blocks.append({
+                "date": block_date or None,
+                "run_date": run_date,
+                "allowed_relative": allowed_relative,
+                "tool": tool,
+            })
+    return blocks
+
+
+_LISTING_TOOLS = {
+    "get_invoices",
+    "get_payments",
+    "get_whatsapp_latest_messages",
+    "get_whatsapp_top_contacts",
+    "get_leads",
+    "get_quotes",
+    "get_orders",
+    "get_crm_follow_up_queue",
+}
+
+
+def _format_tool_csv(tool_name: str, items: list[dict], filename: str) -> str:
+    """Format tool items into RFC 4180 CSV text.
+
+    Adheres strictly to company attribution: each row's company must come strictly
+    from that row's own dict, and is empty string if not present.
+    """
+    import csv
+    import io
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
+
+    if not items:
+        return ""
+
+    if "invoice" in tool_name:
+        writer.writerow(["Invoice Number", "Customer", "Amount", "Balance", "Payment Status", "Order Status", "Invoice Date", "Due Date", "Days Overdue"])
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            writer.writerow([
+                row.get("invoice_number") or row.get("inv_ref") or row.get("invoice_id") or row.get("id") or "",
+                row.get("customer_name") or row.get("customer") or "",
+                f"${row.get('total_amount', 0.0):,.2f}" if isinstance(row.get("total_amount"), (int, float)) else str(row.get("total_amount") or ""),
+                f"${row.get('balance', 0.0):,.2f}" if isinstance(row.get("balance"), (int, float)) else str(row.get("balance") or ""),
+                row.get("payment_status") or "",
+                row.get("order_status") or "",
+                row.get("invoice_date") or "",
+                row.get("due_date") or "",
+                row.get("days_overdue_label") or (f"{row.get('days_overdue')} days overdue" if row.get("days_overdue") is not None else ""),
+            ])
+    elif "payment" in tool_name:
+        writer.writerow(["Payment ID", "Customer", "Amount", "Payment Date", "Payment Method", "Status"])
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            writer.writerow([
+                row.get("id") or row.get("payment_id") or "",
+                row.get("customer") or row.get("customer_name") or "",
+                f"${row.get('amount', 0.0):.2f}" if isinstance(row.get("amount"), (int, float)) else str(row.get("amount") or ""),
+                row.get("date") or row.get("payment_date") or "",
+                row.get("method") or row.get("payment_method") or "",
+                row.get("status") or "",
+            ])
+    elif "whatsapp" in tool_name and "top" in tool_name:
+        writer.writerow(["Name", "Record Type", "Company", "Total Messages", "Inbound Messages", "Outbound Messages", "Latest Message Time"])
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            writer.writerow([
+                row.get("name") or "",
+                row.get("record_type") or "",
+                row.get("company") or "",
+                row.get("whatsapp_count") or 0,
+                row.get("inbound_count") or 0,
+                row.get("outbound_count") or 0,
+                row.get("latest_at") or "",
+            ])
+    elif "whatsapp" in tool_name:
+        writer.writerow(["Name", "Record Type", "Company", "Direction", "Time", "Message"])
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            writer.writerow([
+                row.get("name") or "",
+                row.get("record_type") or "",
+                row.get("company") or "",
+                row.get("latest_direction") or row.get("direction") or "",
+                row.get("latest_at") or row.get("time") or "",
+                row.get("latest_text") or row.get("message") or "",
+            ])
+    elif "lead" in tool_name:
+        writer.writerow(["Lead ID", "Name", "Company", "Status", "Lead Date", "Sales Rep"])
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            writer.writerow([
+                row.get("id") or row.get("lead_id") or "",
+                row.get("name") or "",
+                row.get("company") or "",
+                row.get("status") or "",
+                row.get("created_at") or row.get("date") or "",
+                row.get("rep_name") or row.get("sale_rep") or "",
+            ])
+    elif "quote" in tool_name:
+        writer.writerow(["Quote Ref", "Customer", "Total Amount", "Status", "Date", "Sales Rep"])
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            writer.writerow([
+                row.get("ref") or row.get("id") or "",
+                row.get("customer") or row.get("customer_name") or "",
+                f"${row.get('amount', 0.0):.2f}" if isinstance(row.get("amount"), (int, float)) else str(row.get("amount") or ""),
+                row.get("status") or "",
+                row.get("date") or "",
+                row.get("rep_name") or row.get("sale_rep") or "",
+            ])
+    elif "order" in tool_name:
+        writer.writerow(["Order ID", "Customer", "Total Amount", "Status", "Date", "Sales Rep"])
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            writer.writerow([
+                row.get("id") or row.get("ref") or "",
+                row.get("customer") or row.get("customer_name") or "",
+                f"${row.get('total_amount', 0.0):.2f}" if isinstance(row.get("total_amount"), (int, float)) else str(row.get("total_amount") or ""),
+                row.get("status") or "",
+                row.get("date") or "",
+                row.get("rep_name") or row.get("sale_rep") or "",
+            ])
+    else:
+        first = items[0]
+        if isinstance(first, dict):
+            keys = [k for k in first.keys() if k not in ("_id", "raw")]
+            writer.writerow(keys)
+            for row in items:
+                if isinstance(row, dict):
+                    writer.writerow([str(row.get(k, "") or "") for k in keys])
+
+    return output.getvalue().strip()
+
+
+def _format_tool_table(tool_name: str, items: list[dict], page: dict | None = None) -> str:
+    """Format tool items into a clean markdown table with pagination metadata."""
+    if not items:
+        return ""
+    lines: list[str] = []
+    if page:
+        offset = page.get("offset") or 0
+        limit = page.get("limit") or MAX_TOOL_ROWS
+        total = page.get("total_count") or len(items)
+        page_num = page.get("page") or ((offset // limit) + 1 if limit else 1)
+        pages_tot = page.get("pages_total") or (max(1, (total + limit - 1) // limit) if limit else 1)
+        lines.append(f"Page {page_num} of {pages_tot} ({len(items)} shown of {total} total)\n")
+
+    if "invoice" in tool_name:
+        lines.append("| Invoice | Customer | Amount | Balance | Status | Overdue |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            inv = str(row.get("invoice_number") or row.get("inv_ref") or row.get("invoice_id") or row.get("id") or "—")
+            cust = str(row.get("customer_name") or row.get("customer") or "—")
+            amt = f"${row.get('total_amount', 0.0):.2f}" if isinstance(row.get("total_amount"), (int, float)) else str(row.get("total_amount") or "—")
+            bal = f"${row.get('balance', 0.0):.2f}" if isinstance(row.get("balance"), (int, float)) else str(row.get("balance") or "—")
+            stat = str(row.get("payment_status") or "—")
+            over = str(row.get("days_overdue_label") or (f"{row.get('days_overdue')} days overdue" if row.get("days_overdue") is not None else "No"))
+            lines.append(f"| {inv} | {cust} | {amt} | {bal} | {stat} | {over} |")
+    elif "payment" in tool_name:
+        lines.append("| Payment | Customer | Amount | Date | Status |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- |")
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            pid = str(row.get("id") or row.get("payment_id") or "—")
+            cust = str(row.get("customer") or row.get("customer_name") or "—")
+            amt = f"${row.get('amount', 0.0):.2f}" if isinstance(row.get("amount"), (int, float)) else str(row.get("amount") or "—")
+            dt = str(row.get("date") or row.get("payment_date") or "—")
+            stat = str(row.get("status") or "—")
+            lines.append(f"| {pid} | {cust} | {amt} | {dt} | {stat} |")
+    elif "whatsapp" in tool_name and "top" in tool_name:
+        lines.append("| Name | Record Type | Company | Total Messages | Inbound | Outbound |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or "—")
+            rtype = str(row.get("record_type") or "—")
+            comp = str(row.get("company") or "—")
+            tot = int(row.get("whatsapp_count") or 0)
+            inb = int(row.get("inbound_count") or 0)
+            outb = int(row.get("outbound_count") or 0)
+            if inb + outb == tot:
+                inb_str = str(inb)
+                outb_str = str(outb)
+            else:
+                inb_str = "—"
+                outb_str = "—"
+            lines.append(f"| {name} | {rtype} | {comp} | {tot} | {inb_str} | {outb_str} |")
+    elif "whatsapp" in tool_name:
+        lines.append("| Name | Record Type | Company | Direction | Time | Message |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or "—")
+            rtype = str(row.get("record_type") or "—")
+            comp = str(row.get("company") or "—")
+            direc = str(row.get("latest_direction") or row.get("direction") or "—")
+            raw_time = row.get("latest_at") or row.get("time")
+            t_str = str(format_human_timestamp(raw_time) if raw_time else "—")
+            msg = str(row.get("latest_text") or row.get("message") or "—").replace("\n", " ")
+            lines.append(f"| {name} | {rtype} | {comp} | {direc} | {t_str} | {msg} |")
+    elif "lead" in tool_name:
+        lines.append("| Lead | Company | Status | Next Action |")
+        lines.append("| :--- | :--- | :--- | :--- |")
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            lead_name = str(row.get("name") or row.get("id") or "—")
+            comp = str(row.get("company") or "—")
+            stat = str(row.get("status") or "—")
+            act = str(row.get("next_action") or "—")
+            lines.append(f"| {lead_name} | {comp} | {stat} | {act} |")
+    elif "quote" in tool_name:
+        lines.append("| Quote | Customer | Amount | Status | Date |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- |")
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            ref = str(row.get("ref") or row.get("id") or "—")
+            cust = str(row.get("customer") or row.get("customer_name") or "—")
+            amt = f"${row.get('amount', 0.0):.2f}" if isinstance(row.get("amount"), (int, float)) else str(row.get("amount") or "—")
+            stat = str(row.get("status") or "—")
+            dt = str(row.get("date") or "—")
+            lines.append(f"| {ref} | {cust} | {amt} | {stat} | {dt} |")
+    elif "queue" in tool_name or "follow_up" in tool_name:
+        lines.append("| Customer | Company | Channel | Waiting (days) | Last Message |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- |")
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or "—")
+            comp = str(row.get("company") or "—")
+            chan = str(row.get("channel") or "—")
+            wait = str(row.get("waiting_days") or 0)
+            msg = str(row.get("last_customer_message") or "—").replace("\n", " ")
+            lines.append(f"| {name} | {comp} | {chan} | {wait} | {msg} |")
+    else:
+        first = items[0]
+        if isinstance(first, dict):
+            keys = [k for k in first.keys() if k not in ("_id", "raw")][:5]
+            lines.append("| " + " | ".join(keys) + " |")
+            lines.append("| " + " | ".join([":---"] * len(keys)) + " |")
+            for row in items:
+                if isinstance(row, dict):
+                    lines.append("| " + " | ".join(str(row.get(k, "—") or "—") for k in keys) + " |")
+
+    return "\n".join(lines)
 
 
 def _answer_consistency_errors(text: str, tool_results: list[dict], named_period: str | None) -> list[str]:
@@ -891,10 +1378,40 @@ def _answer_consistency_errors(text: str, tool_results: list[dict], named_period
     errors: list[str] = []
     expected = _PERIOD_PHRASES.get(named_period) if named_period else None
     if expected:
-        lowered = text.casefold()
-        for phrase in _PERIOD_PHRASES.values():
-            if phrase != expected and phrase in lowered:
-                errors.append(f"period wording '{phrase}' contradicts the resolved range ({expected})")
+        dated_blocks = _extract_dated_tool_blocks(tool_results)
+        text_blocks = _BLOCK_SPLIT_RE.split(text)
+        for t_block in text_blocks:
+            t_block = t_block.strip()
+            if not t_block:
+                continue
+            lowered_block = t_block.casefold()
+
+            matched_phrases: set[str] = set()
+            for phrase in _PERIOD_PHRASES_SORTED:
+                if any(phrase in longer for longer in matched_phrases):
+                    continue
+                if re.search(rf"\b{re.escape(phrase)}\b", lowered_block):
+                    matched_phrases.add(phrase)
+
+            for phrase in matched_phrases:
+                if phrase == expected:
+                    continue
+                # phrase != expected: judge against that block's date if this block belongs to a dated tool block
+                dtb_match = None
+                for dtb in dated_blocks:
+                    b_date = dtb["date"]
+                    r_date = dtb["run_date"]
+                    if (b_date and b_date in t_block) or (r_date and r_date in t_block) or "run date" in lowered_block:
+                        dtb_match = dtb
+                        break
+
+                if dtb_match is not None:
+                    # Judge phrase against THAT BLOCK's date
+                    if phrase in dtb_match["allowed_relative"]:
+                        continue
+                    errors.append(f"period wording '{phrase}' contradicts that block's date ({dtb_match['date']})")
+                else:
+                    errors.append(f"period wording '{phrase}' contradicts the resolved range ({expected})")
     if _PERIOD_ECHO_RE.search(text):
         errors.append("the answer echoes a backend period code instead of a plain phrase")
 
@@ -946,6 +1463,34 @@ def _answer_consistency_errors(text: str, tool_results: list[dict], named_period
             "the answer states an exact payment time but the source records dates only"
         )
 
+    # A shipped draft may not carry an unfilled placeholder ("Hi {Name}") and,
+    # on a leads turn, may not answer a missing spec with an "e.g." list of
+    # candidate values ("finish (e.g. gloss, matte)") that the records do not
+    # hold - both are inventions in advice prose, not grounded asks.
+    if _UNFILLED_PLACEHOLDER_RE.search(text):
+        errors.append("the answer carries an unfilled placeholder such as {Name}")
+    if _EXAMPLE_CUE_RE.search(text):
+        lead_rows = any(
+            isinstance(row, dict) and isinstance(row.get("missing"), list)
+            for entry in tool_results
+            if isinstance(entry, dict) and isinstance(entry.get("result"), dict)
+            for row in (entry["result"].get("items") or [])
+        )
+        if lead_rows:
+            evidence_blob = json.dumps(
+                [entry.get("result") for entry in tool_results if isinstance(entry, dict)],
+                ensure_ascii=False, default=str,
+            ).lower()
+            invented_examples = [
+                word for word in _SPEC_VALUE_RE.findall(text)
+                if word.lower() not in evidence_blob
+            ]
+            if invented_examples:
+                errors.append(
+                    "the answer suggests example specs the records do not hold: "
+                    + ", ".join(sorted({word.lower() for word in invented_examples}))
+                )
+
     # Payment rows actually rendered vs a claim that more were displayed.
     rows = len(_PAYMENT_ROW_RE.findall(text))
     if rows >= 1:
@@ -954,10 +1499,150 @@ def _answer_consistency_errors(text: str, tool_results: list[dict], named_period
             if claimed > rows:
                 errors.append(f"claims {int(claimed)} payments shown but only {rows} appear in the answer")
                 break
+
+    # An answer may NEVER claim more records are on later pages unless a listing tool
+    # result in this turn has has_more=True.
+    has_more_proven = any(
+        isinstance(entry.get("result"), dict) and entry["result"].get("has_more") is True
+        for entry in tool_results
+        if isinstance(entry, dict)
+    )
+    if not has_more_proven and re.search(
+        r"\b(?:more\s+(?:records|messages|contacts|rows|results)?\s*(?:are\s+)?on\s+later\s+pages|more\s+records\s+on\s+later\s+pages)\b",
+        text,
+        re.I,
+    ):
+        errors.append("claims more records exist on later pages but has_more is false")
+
+    # Item D: Never offer an infeasible live CRM sweep for never-messaged contacts
+    if re.search(
+        r"\b(?:crm[- ]side check|attempt a crm[- ]side|sweep the crm|check the crm for customers with no whatsapp)\b",
+        text,
+        re.I,
+    ):
+        errors.append("offers an infeasible CRM sweep for never-messaged contacts")
+
+    # Item C: In CSV text, company attribution must match index records
+    if "Record Type" in text and "Company" in text and "," in text:
+        for entry in tool_results:
+            if not isinstance(entry, dict):
+                continue
+            res = entry.get("result")
+            if not isinstance(res, dict):
+                continue
+            for item in (res.get("items") or []):
+                if isinstance(item, dict) and item.get("name") and not item.get("company"):
+                    target_name = item["name"]
+                    source_companies = [
+                        (it.get("company") or "").casefold()
+                        for it in (res.get("items") or [])
+                        if isinstance(it, dict) and (it.get("name") or "").casefold() == target_name.casefold()
+                    ]
+                    if "" in source_companies and any(c != "" for c in source_companies):
+                        import csv
+                        import io
+                        csv_companies = []
+                        try:
+                            reader = csv.reader(io.StringIO(text))
+                            for row in reader:
+                                if len(row) >= 3 and row[0].strip().casefold() == target_name.casefold():
+                                    csv_companies.append(row[2].strip().casefold())
+                        except Exception:
+                            pass
+                        if csv_companies and "" not in csv_companies:
+                            errors.append(f"CSV filled missing company for {target_name} by copying from another row")
+                            break
+
+    # Issue 2 + Addendum: file/download/view words are allowed ONLY when a real file link is present.
+    # If no file link is present, reject file/download/export/attachment wording.
+    has_file_link = bool(
+        re.search(r"\[(?:Download\b|View\b|[^\]]+\.csv\b)[^\]]*\]\((?:#download:[^)]+|[^)]+\.csv)\)", text, re.I)
+        or re.search(r"\[[^\]]+\]\((?:#download:[^)]+|[^)]+\.csv)\)", text, re.I)
+    )
+    has_csv_content = bool(
+        re.search(r"```(?:csv)?\s*\n[^\n]+,[^\n]+\n", text, re.I)
+        or ("," in text and ("\n" in text) and any(hdr in text for hdr in ["Name,", "Record Type,", "Payment,", "Date,"]))
+    )
+    real_file_present = has_file_link and has_csv_content
+
+    # Disclaimers like "not a downloadable file" or "not a file" do NOT describe CSV as a file.
+    text_for_csv_wording = re.sub(
+        r"\b(?:not|never|no)\s+(?:a\s+)?(?:downloadable\s+)?(?:file|attachment)\b",
+        " ",
+        text,
+        flags=re.I,
+    )
+    csv_file_wording = bool(
+        re.search(r"\b(?:download\b[^.!?\n]{0,40}\bcsv|csv\b[^.!?\n]{0,40}\b(?:download|downloadable|attachment|file)|"
+                  r"exported\s+as\s+csv|export(?:ed)?\s+as\s+a\s+file|csv\s+file)\b", text_for_csv_wording, re.I)
+    )
+    if csv_file_wording and not real_file_present:
+        errors.append("the answer describes CSV with file/download/export wording but contains no downloadable file link")
+
+    # Issue 1: CSV turn consistency checks
+    is_csv_turn = any(
+        isinstance(e.get("result"), dict) and (e["result"].get("is_csv_turn") or e["result"].get("deterministic_csv"))
+        for e in tool_results
+        if isinstance(e, dict)
+    )
+    if is_csv_turn:
+        if not (has_file_link and has_csv_content):
+            errors.append("CSV request answer is missing a download link or CSV block")
+        for entry in tool_results:
+            if isinstance(entry, dict) and isinstance(entry.get("result"), dict):
+                res = entry["result"]
+                items = res.get("items") or res.get("results") or []
+                if items:
+                    total_rows = len(items)
+                    for m in re.finditer(r"\b(\d+)\s+rows?\b", text, re.I):
+                        claimed = int(m.group(1))
+                        if claimed != total_rows:
+                            errors.append(f"claims {claimed} rows but walked {total_rows} rows")
+                            break
+                if res.get("walk_complete"):
+                    if re.search(r"\b(?:more\s+(?:records|messages|contacts|rows|invoices|payments)?\s*(?:are\s+)?on\s+later\s+pages|more\s+can\s+be\s+fetched|\d+\s+more\s+are\s+on\s+later\s+pages)\b", text, re.I):
+                        errors.append("claims unfetched later pages exist after a complete walk")
+
+    # Issue 2: A list/page answer must not collapse to a rows-free verification summary
+    is_verification_summary = bool(
+        re.search(r"\bVerified\s+from\s+backend\s+records\b", text, re.I)
+        or re.search(r"^\s*Verified\b", text, re.I | re.M)
+        or re.search(r"\bChecked\s+against\s+\d+\s+backend\s+lookups\b", text, re.I)
+    )
+    if not is_csv_turn and not real_file_present and is_verification_summary:
+        for entry in tool_results:
+            if not isinstance(entry, dict):
+                continue
+            tool_name = str(entry.get("tool") or "")
+            if tool_name in _LISTING_TOOLS:
+                res = entry.get("result")
+                if isinstance(res, dict):
+                    items = res.get("items") or res.get("results") or []
+                    if items and len(items) > 0:
+                        has_table = "|" in text and text.count("\n|") >= 2
+                        has_bullets = len(re.findall(r"^\s*(?:[-*+]|\d+[.)])\s+", text, re.M)) >= min(2, len(items))
+                        has_lead_lines = "—" in text or "Lead " in text or "Invoice " in text or "Payment " in text
+                        if not (has_table or has_bullets or has_lead_lines):
+                            errors.append("list answer contains zero rows; a rows-free verification summary is not allowed")
+                            break
+
+    # Issue 3: Raw microsecond ISO timestamps prohibited in visible prose
+    text_no_code = re.sub(r"```[\s\S]*?```", "", text)
+    if re.search(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+", text_no_code):
+        errors.append("answer contains raw microsecond timestamp; use human-readable format (e.g. Nov 2, 2026, 9:54 PM UTC)")
+
+    # Issue 5: Pluralization check (reject "1 rows")
+    if re.search(r"\b1\s+rows\b", text, re.I):
+        errors.append("pluralization error: '1 rows' should be '1 row'")
+
+    # Issue 5: Re-index runner command check
+    if re.search(r"\brunwhatsappindex\b", text, re.I):
+        errors.append("re-index command must be 'server/run_whatsapp_index.py --full'")
+
     return list(dict.fromkeys(errors))
 
 
-def _evidence_summary(tool_results: list[dict], period_phrase: str | None = None) -> str | None:
+def _evidence_summary(tool_results: list[dict], period_phrase: str | None = None, question: str = "") -> str | None:
     """A deterministic answer built only from this turn's verified tool evidence.
 
     When the model's prose is rejected (by the numeric guard or by the wording /
@@ -973,6 +1658,60 @@ def _evidence_summary(tool_results: list[dict], period_phrase: str | None = None
     an unfinished walk is reported as a total with records still on later pages,
     never as "N listed here".
     """
+    # Deterministic CSV emission
+    for entry in tool_results:
+        if isinstance(entry, dict) and isinstance(entry.get("result"), dict):
+            det_csv = entry["result"].get("deterministic_csv")
+            if det_csv:
+                return det_csv
+
+    # Never-messaged question refusal
+    if question and re.search(r"\b(?:never|zero\s+messages?|no\s+messages?|haven'?t\s+messaged|hasn'?t\s+messaged|not\s+messaged)\b", question, re.I):
+        for entry in tool_results:
+            if not isinstance(entry, dict):
+                continue
+            tool_name = str(entry.get("tool") or "")
+            if "whatsapp" in tool_name:
+                res = entry.get("result") or {}
+                cov = res.get("coverage") or {}
+                cov_label = cov.get("label") or res.get("coverage_label") or (
+                    f"Indexed {cov.get('indexed_person_records', 0)} of {cov.get('total_person_records', 0):,} person records"
+                )
+                return (
+                    f"The WhatsApp index is partial — I cannot reliably list people who have never had a WhatsApp message.\n\n"
+                    f"Coverage: {cov_label}\n\n"
+                    "Allowed options:\n"
+                    "1) Page through the records that have messages.\n"
+                    "2) Export them as CSV text in chat to compare offline.\n"
+                    "3) Run a full index sweep via `server/run_whatsapp_index.py --full`."
+                )
+
+    # get_crm_follow_up_queue evidence summary
+    for entry in tool_results:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("tool") == "get_crm_follow_up_queue":
+            res = entry.get("result") or {}
+            if res.get("available") is False:
+                return (
+                    "No finished agent run yet — the follow-up queue is computed by an agent run. "
+                    "Start one from the Run agents button (or wait for the 6 AM daily run)."
+                )
+            as_of_human = res.get("as_of_human") or format_human_timestamp(res.get("as_of")) or "the latest run"
+            waiting_total = res.get("waiting_total", 0)
+            if waiting_total == 0:
+                prev = res.get("previous_run_waiting")
+                tail = f" (previous run had {prev} waiting)" if prev is not None else ""
+                return f"As of {as_of_human} — 0 customers waiting in the latest run{tail}."
+            summary = f"As of {as_of_human} — {waiting_total} customers waiting in the latest run."
+            queue = res.get("queue") or []
+            if queue:
+                table = _format_tool_table("get_crm_follow_up_queue", queue)
+                candidate = f"{summary}\n\n{table}"
+                if not validate_numeric_claims(candidate, tool_results, "", ""):
+                    return candidate
+            return summary
+
     money_evidence = None
     count_evidence = None
     page_evidence = None
@@ -1005,16 +1744,22 @@ def _evidence_summary(tool_results: list[dict], period_phrase: str | None = None
         span = f" ({window['date_from']} to {window['date_to']})"
     scope = f" for {period_phrase}" if period_phrase else ""
 
+    has_more = bool(evidence.get("has_more")) or (int(evidence.get("records_remaining") or 0) > 0)
+
     if "money_total" in evidence:
         amount = format_money(evidence["money_total"])
         if "records_total" in evidence:
             total = evidence["records_total"]
             if evidence.get("complete"):
                 sentence = f"Verified from backend records{scope}: {amount} across all {total} matching {noun}{span}."
-            else:
+            elif has_more:
                 remaining = evidence.get("records_remaining")
                 tail = f"; {remaining} more are on later pages and can be fetched." if remaining else "; more records are on later pages."
                 sentence = f"Verified from backend records{scope}: {amount} across {total} matching {noun}{span}" + tail
+            elif evidence.get("records_returned", 0) == 0:
+                sentence = f"Verified from backend records{scope}: that offset is past the end of the {total} matching {noun}; no more records to fetch."
+            else:
+                sentence = f"Verified from backend records{scope}: {amount} across all {total} matching {noun}{span}."
         elif "record_count" in evidence:
             count = evidence["record_count"]
             sentence = f"Verified from backend records{scope}: {amount} across {count} matching {noun}{span}."
@@ -1025,15 +1770,39 @@ def _evidence_summary(tool_results: list[dict], period_phrase: str | None = None
             total = evidence["records_total"]
             if evidence.get("complete"):
                 sentence = f"Verified from backend records{scope}: all {total} matching {noun}{span}."
-            else:
+            elif has_more:
                 remaining = evidence.get("records_remaining")
                 tail = f"; {remaining} more are on later pages and can be fetched." if remaining else "; more records are on later pages."
                 sentence = f"Verified from backend records{scope}: {total} matching {noun}{span}" + tail
+            elif evidence.get("records_returned", 0) == 0:
+                sentence = f"Verified from backend records{scope}: that offset is past the end of the {total} matching {noun}; no more records to fetch."
+            else:
+                sentence = f"Verified from backend records{scope}: all {total} matching {noun}{span}."
         else:
             count = evidence["record_count"]
             sentence = f"Verified from backend records{scope}: {count} matching {noun}{span}."
 
     summary = sentence.strip()
+
+    # Summary-collapse prevention: deliver rows as table
+    listing_table = None
+    for entry in tool_results:
+        if not isinstance(entry, dict):
+            continue
+        tool_name = str(entry.get("tool") or "")
+        res = entry.get("result")
+        if isinstance(res, dict) and tool_name in _LISTING_TOOLS:
+            items = res.get("items") or res.get("results") or res.get("queue") or []
+            if items:
+                page_meta = _page_block(res)
+                listing_table = _format_tool_table(tool_name, items, page_meta)
+                break
+
+    if listing_table:
+        candidate = f"{summary}\n\n{listing_table}"
+        if not validate_numeric_claims(candidate, tool_results, "", ""):
+            summary = candidate
+
     if not summary or validate_numeric_claims(summary, tool_results, "", ""):
         return None
     return summary
@@ -1277,6 +2046,7 @@ def tool_evidence(name: str, result: Any) -> dict | None:
         evidence["records_total"] = page["total_count"]
         evidence["records_returned"] = page["returned"]
         evidence["records_remaining"] = page.get("remaining_count")
+        evidence["has_more"] = page.get("has_more") is True
         # the tool's own verdict on whether the walk is complete - which is not
         # simply "nothing left after this offset" (a page past the end delivers
         # nothing yet proves nothing)
@@ -1356,6 +2126,9 @@ def query_context(tool: str, args: Any, page: dict, question: str = "") -> dict:
         "returned": page["returned"],
         "remaining_count": page.get("remaining_count"),
         "has_more": page["has_more"],
+        "all_records_returned": page.get("all_records_returned"),
+        "page": page.get("page"),
+        "pages_total": page.get("pages_total"),
         "next_offset": page.get("next_offset"),
         "question": (question or "")[:_MAX_CONTEXT_VALUE_CHARS],
         # when the walk was recorded, so a follow-up days later can tell that the
@@ -1408,7 +2181,9 @@ def _continuation_prompt(last_query: dict) -> str:
         f"{str(last_query.get('question') or '')!r}.\n"
         f"{staleness}"
         "Read the new message against that record. 'the rest', 'show all', 'yes', 'get them all', "
-        "'next' or a count of what is left mean call the SAME tool with the SAME args and offset set "
+        "'next' or a count of what is left mean call the SAME tool with the SAME args and the SAME "
+        "limit as the recorded page (never re-choose a page size - the page numbers must agree "
+        "across turns) and offset set "
         "to the last next_offset, and keep going until has_more is false. 'again' or 'what did you say' "
         "mean repeat that query unchanged. A question about other data or other filters is a NEW query "
         "- call a tool afresh and let this record go. Never widen, drop or change the recorded date "
@@ -1448,7 +2223,46 @@ _NEXT_PAGE_PHRASES = (
     # ran and the model re-called a tool steered by the recorded query
     "show next page", "show the next page", "show next", "get next page",
     "load next page",
+    # live Nov 2: "show me the NEXT page" matched nothing, so the executor
+    # never ran and the model re-queried with a fresh default limit - the
+    # same listing then read "page 1 of 1" and "page 2 of 3" in one thread
+    "show me the next page", "show me next page", "show me the next",
+    "give me the next page",
 )
+
+
+_CSV_REQUEST_RE = re.compile(
+    r"\b(?:csv\b|export\s+(?:this\s+)?as\s+csv|give\s+me\s+(?:this\s+as\s+)?csv|csv\s+mein)\b",
+    re.I,
+)
+_BARE_CSV_PATTERNS = (
+    r"^(?:(?:can\s+you\s+)?(?:give|show|send|export|provide|download|get)(?:\s+me)?\s+)?(?:this|it|these|that|the\s+list|all)(?:\s+(?:all\s+)?(?:in|as|into|to))?\s*csv[\s.!?]*$",
+    r"^(?:(?:can\s+you\s+)?(?:give|show|send|export|provide|download|get)(?:\s+me)?\s+)?csv(?:\s+(?:file|download|format|please))?[\s.!?]*$",
+    r"^(?:in|as)\s+csv[\s.!?]*$",
+    r"^csv\s+mein[\s.!?]*$",
+    r"^export\s+(?:as\s+)?csv[\s.!?]*$",
+)
+_BARE_CSV_RE = re.compile("|".join(_BARE_CSV_PATTERNS), re.I)
+_ENTITY_OR_FILTER_RE = re.compile(
+    r"\b(?:invoice|invoices|inv|quote|quotes|order|orders|payment|payments|lead|leads|whatsapp|contact|contacts|customer|customers)\b"
+    r"|\b\d{2,}\b"
+    r"|\bfor\s+[a-zA-Z0-9]"
+    r"|\bfrom\s+[a-zA-Z0-9]"
+    r"|\bunpaid\b|\boverdue\b|\bpending\b|\bapproved\b",
+    re.I,
+)
+
+
+def _is_csv_request(message: str) -> bool:
+    text = " ".join((message or "").strip().lower().split()).strip("!. ")
+    return bool(_CSV_REQUEST_RE.search(text))
+
+
+def _is_bare_csv_request(message: str) -> bool:
+    text = " ".join((message or "").strip().lower().split()).strip("!. ")
+    if _ENTITY_OR_FILTER_RE.search(text):
+        return False
+    return bool(_BARE_CSV_RE.search(text)) or bool(_CSV_REQUEST_RE.fullmatch(text))
 
 
 def _confirmation_kind(message: str) -> str | None:
@@ -1552,6 +2366,51 @@ _SECTION_TOOLS = {
     "orders": "get_orders",
 }
 
+# ---------------------------------------------------------------------------
+# routing nudges
+#
+# Live Nov 2: "Show me TREATDAY's CRM payments" went down the CRM path, hit a
+# CRM timeout with no saved copy, and ended as a bare choice question with no
+# ERP figure - the P4 golden rule says a payments question is answered from
+# the ERP ledger even when the user names the CRM. "Find Frank Jr... give me
+# the CRM AI analysis" ended as "Lead or Contact?" after the search returned
+# both exact matches. The descriptions and CHAT_SYSTEM now forbid both, and
+# these nudges enforce them in code: when a turn is about to answer without a
+# tool call after going down the wrong path, one backend directive sends it
+# back through the tools. Once per turn, and only while tool calls remain.
+# ---------------------------------------------------------------------------
+
+_CRM_RECORD_TOOLS = {
+    "search_customer360", "get_customer360",
+    "get_customer360_analysis", "get_customer360_analyses",
+}
+_ANALYSIS_TOOLS = {"get_customer360_analysis", "get_customer360_analyses"}
+_ERP_LEDGER_TOOLS = {
+    "get_payments", "get_revenue", "get_invoices", "get_quotes", "get_orders",
+    "get_customer_profile", "get_customer_context", "get_top_unpaid",
+    "get_top_open_quotes", "get_dashboard_metrics", "search_records", "get_record",
+}
+_LEDGER_QUESTION_RE = re.compile(r"payment|paid|invoice|quote", re.I)
+_ANALYSIS_QUESTION_RE = re.compile(r"analys|analyz", re.I)
+
+ERP_LEDGER_DIRECTIVE = (
+    "This question asks about payments, invoices or quotes: those are answered from the ERP "
+    "ledger only. The CRM record search opened on this turn does not answer it - a CRM record "
+    "section is not a second ledger, and a CRM timeout is not a reason to leave the question "
+    "unanswered. Call get_payments (or get_invoices / get_quotes) with the customer or company "
+    "name now; with no period it scans all time. Report the ERP total first, then the rows. "
+    "Do not end this answer with a choice between retrying the CRM and pulling the ERP, and "
+    "do not end it with a question and no figure."
+)
+CRM_ANALYSIS_DIRECTIVE = (
+    "The user asked for this person's CRM AI analysis, but no analysis was fetched. If "
+    "search_customer360 returned two exact matches for the name (the Lead and the Contact), "
+    "they are two records of the one person: call get_customer360_analyses ONCE with both "
+    "records and present BOTH analyses in one answer, each labeled as CRM AI output with "
+    "Verified/placeholder honesty. One record's failure must not take the other's analysis "
+    "down. Never ask the user to choose which record to analyze."
+)
+
 
 async def _invoke_recorded(
     name: str,
@@ -1598,6 +2457,7 @@ async def _walk_pages(
     events: Any,
     start_offset: int = 0,
     max_pages: int = 10,
+    unbounded: bool = False,
 ) -> tuple[dict, list[str]]:
     """Fetch consecutive pages of one tool and merge them honestly.
 
@@ -1643,6 +2503,15 @@ async def _walk_pages(
         offset = page["next_offset"]
     merged = dict(aggregates)
     merged["items"] = items
+    if unbounded:
+        merged["offset"] = start_offset
+        merged["limit"] = MAX_TOOL_ROWS
+        merged["total_count"] = total or len(items)
+        merged["returned"] = len(items)
+        merged["remaining_count"] = 0
+        merged["has_more"] = False
+        merged["walk_complete"] = True
+        return merged, call_keys
     merged.update(_page_metadata(start_offset, MAX_TOOL_ROWS, total, len(items)))
     merged["walk_complete"] = bool(last_page and not last_page["has_more"])
     return _bounded(merged), call_keys
@@ -1763,11 +2632,20 @@ async def _execute_pending_action(
         )
         if page is not None and page["has_more"]:
             new_pending = _pending_from_context(fetched_context)
-        directive = (
-            "CONFIRMED RETRIEVAL EXECUTED. The user confirmed, and the backend has "
-            "fetched the next page of the recorded query (the tool results below). "
-            "Answer from it and do not repeat the previous offer."
-        )
+        if page is not None and not page.get("returned") and not page.get("has_more"):
+            directive = (
+                "CONFIRMED RETRIEVAL EXECUTED. That offset is past the end of the matching "
+                f"records (all {page.get('total_count', 0)} records were on earlier pages); "
+                "no rows were returned. State plainly that there are no more rows past the end "
+                "and nothing more to fetch. Do not cite a page number that implies rows exist "
+                "and do not claim more records are on later pages."
+            )
+        else:
+            directive = (
+                "CONFIRMED RETRIEVAL EXECUTED. The user confirmed, and the backend has "
+                "fetched the next page of the recorded query (the tool results below). "
+                "Answer from it and do not repeat the previous offer."
+            )
         return {
             "results": results, "call_keys": call_keys, "pending": new_pending,
             "directive": directive, "context": fetched_context,
@@ -1859,6 +2737,8 @@ def build_chat_graph(model: Any = None, tools: list | None = None):
                 seen_calls[key] = entry["result"]
         count = 0
         regen_count = 0
+        erp_nudged = False
+        analysis_nudged = False
         validation_started = False
         validation_replaced = False
         usage = empty_usage()
@@ -2085,6 +2965,40 @@ def build_chat_graph(model: Any = None, tools: list | None = None):
                     )
                 continue
 
+            if not calls and count < MAX_TOOL_CALLS and used:
+                # A turn about to answer with no tool call after going down the
+                # wrong path gets exactly one backend directive back: the CRM
+                # path never answers a ledger question, and an analysis question
+                # that fetched no analysis is sent back to the tools (see the
+                # routing nudges above).
+                question = _last_user_text(state["messages"])
+                if (
+                    not erp_nudged
+                    and _LEDGER_QUESTION_RE.search(question)
+                    and set(used) & _CRM_RECORD_TOOLS
+                    and not set(used) & _ERP_LEDGER_TOOLS
+                ):
+                    erp_nudged = True
+                    log.info("chat: steering a ledger question from the CRM path back to the ERP tools")
+                    if events is not None and attempt_emitted:
+                        # the provisional answer was streamed; the corrected
+                        # one replaces it, as a validation reset does
+                        events.put_nowait({"event": "reset", "data": {}})
+                    messages.append(SystemMessage(content=ERP_LEDGER_DIRECTIVE))
+                    continue
+                if (
+                    not analysis_nudged
+                    and _ANALYSIS_QUESTION_RE.search(question)
+                    and "search_customer360" in used
+                    and not set(used) & _ANALYSIS_TOOLS
+                ):
+                    analysis_nudged = True
+                    log.info("chat: an analysis question ended without any analysis fetched")
+                    if events is not None and attempt_emitted:
+                        events.put_nowait({"event": "reset", "data": {}})
+                    messages.append(SystemMessage(content=CRM_ANALYSIS_DIRECTIVE))
+                    continue
+
             final_text = _scrub_null_placeholders(_format_answer_money(_message_text(response)))
             period_phrase = _period_phrase(named_period)
             # A no-tool-call response IS the answer generation, and the guard
@@ -2114,7 +3028,7 @@ def build_chat_graph(model: Any = None, tools: list | None = None):
                 # proved, or the honest fallback when they proved no figure -
                 # and when every tool errored, say the lookup failed, not that
                 # a figure could not be verified.
-                final_text = _evidence_summary(results, period_phrase) or (
+                final_text = _evidence_summary(results, period_phrase, _last_user_text(messages)) or (
                     _lookup_failed_text(_last_user_text(messages))
                     if _all_tools_failed(results)
                     else _fallback_text(_last_user_text(messages))
@@ -2140,9 +3054,15 @@ def build_chat_graph(model: Any = None, tools: list | None = None):
                             "Regenerate your answer once. Remove any amount or count that is not copied from this turn's tool results. "
                             "Page counts are supported evidence: total_count, returned, remaining_count, offset and next_offset were "
                             "computed by the tool, so keep them. While has_more is true you may not claim the listing was complete: "
-                            "say which page this is and that the rest can be fetched. Describe the period with the plain words for the "
+                            "say which page this is and that the rest can be fetched. When the page came back shorter than its limit "
+                            "(page_shorter_than_requested), describe it with the rows it really carried - '26 shown of 202' - and never "
+                            "quote the limit next to pages_total, because the page arithmetic runs on the delivered rows. Describe the "
+                            "period with the plain words for the "
                             "range the backend resolved (for example 'last week'), never a different period or a code like (last_week). "
+                            "For dated briefing blocks, state the explicit calendar date (e.g. 'CRM payments for 2026-11-01'). "
                             "Do not say a number of records are listed or shown unless that many records actually appear in your answer. "
+                            "If a draft or message you wrote contains an unfilled placeholder such as {Name}, rewrite it addressing the "
+                            "person by the name the record holds; never fill a missing spec with example values (e.g. foil/film/paper). "
                             "If the result is still unavailable, say the figure could not be verified. Reply in the user's language."
                         )
                     )
@@ -2161,7 +3081,7 @@ def build_chat_graph(model: Any = None, tools: list | None = None):
                     payload={"outcome": "replaced"},
                 )
             validation_replaced = True
-            final_text = _evidence_summary(results, period_phrase) or (
+            final_text = _evidence_summary(results, period_phrase, _last_user_text(messages)) or (
                 _lookup_failed_text(_last_user_text(messages))
                 if _all_tools_failed(results)
                 else _fallback_text(_last_user_text(messages))
@@ -2255,6 +3175,29 @@ async def execute_chat(
                     content=json.dumps(entry["result"], ensure_ascii=False, default=str),
                     tool_call_id=call_id,
                     name=entry["tool"],
+                )
+            )
+    elif forced_directive:
+        messages.append(SystemMessage(content=forced_directive))
+    elif _confirmation_kind(message) == "next_page" and last_query:
+        total = int(last_query.get("total_count") or 0)
+        returned = int(last_query.get("returned") or 0)
+        offset = int(last_query.get("offset") or 0)
+        has_more = bool(last_query.get("has_more"))
+        all_returned = bool(last_query.get("all_records_returned"))
+        if offset == 0 and not has_more and (all_returned or (total > 0 and returned >= total)):
+            tool_name = str(last_query.get("tool") or "")
+            noun = "WhatsApp messages" if "whatsapp" in tool_name else "matching records"
+            messages.append(
+                SystemMessage(
+                    content=(
+                        f"The previous query for {noun} returned all {total} records on the first page "
+                        "(page 1 of 1). The user is asking for the next page, but no next page exists. "
+                        f"State plainly that all {total} {noun} were already returned in the previous "
+                        "answer and there are no further records or later pages to fetch. "
+                        "Do not call any tool, do not claim more records are on later pages, "
+                        "and do not quote a page number that implies rows exist."
+                    )
                 )
             )
     graph = build_chat_graph(model=model, tools=tools)
@@ -2424,6 +3367,247 @@ async def run_chat(
         except Exception:
             log.exception("pending action execution failed; falling back to a normal turn")
             forced = {"results": [], "pending": pending_previous, "directive": ""}
+    elif confirmation == "next_page" and not pending_previous and last_query:
+        total = int(last_query.get("total_count") or 0)
+        returned = int(last_query.get("returned") or 0)
+        offset = int(last_query.get("offset") or 0)
+        has_more = bool(last_query.get("has_more"))
+        all_returned = bool(last_query.get("all_records_returned"))
+        if offset == 0 and not has_more and (all_returned or (total > 0 and returned >= total)):
+            # Whole listing + next page -> "already complete" answer:
+            # no claim of later pages, no fetch that contradicts, no page number implying rows exist.
+            tool_name = str(last_query.get("tool") or "")
+            noun = "WhatsApp messages" if "whatsapp" in tool_name else "matching records"
+            answer_text = (
+                f"All {total} {noun} were already returned on the first page; "
+                "there are no more records to fetch."
+            )
+            updated_turns = trim_turns([
+                *turns,
+                {"question": message, "answer": answer_text, "created_at": started, "task_id": task_id},
+            ])
+            await db.chat_threads.update_one(
+                {"thread_id": thread_id},
+                {"$set": {
+                    "turns": updated_turns,
+                    "last_query": last_query,
+                    "pending_action": None,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }},
+                upsert=True,
+            )
+            duration_ms = round((monotonic_time.monotonic() - turn_started) * 1000)
+            await service.emit(
+                task_id=task_id, type="agent.completed", agent_id="chat",
+                payload={"tools_used": 0, "duration_ms": duration_ms},
+            )
+            await service.emit(
+                task_id=task_id, type="task.completed", agent_id="chat",
+                payload={"tools_used": 0, "total_tokens": 0, "duration_ms": duration_ms},
+            )
+            return {
+                "text": answer_text,
+                "tools_used": [],
+                "tool_results": [],
+                "tokens": empty_usage(),
+                "emitted_tokens": 0,
+                "query_context": last_query,
+                "validation_replaced": False,
+                "task_id": task_id,
+            }
+        # Sticky pagination (live Nov 2): the recorded listing came back
+        # whole, so no pending action exists - but "the next page" still
+        # means THAT listing with THAT page size. The backend advances the
+        # recorded offset by the recorded limit itself, so the model cannot
+        # re-choose a different limit and make the page counts disagree
+        # across turns. Past the end the tool answers honestly: an empty
+        # page and the past-the-end note.
+        try:
+            recorded_limit = max(1, int(last_query.get("limit") or MAX_TOOL_ROWS))
+            recorded_offset = int(last_query.get("offset") or 0)
+            next_offset = last_query.get("next_offset")
+            if not isinstance(next_offset, int):
+                next_offset = recorded_offset + recorded_limit
+            forced = await _execute_pending_action(
+                {
+                    "kind": "next_page",
+                    "tool": last_query.get("tool"),
+                    "args": last_query.get("args") or {},
+                    "next_offset": next_offset,
+                    "limit": recorded_limit,
+                    "total_count": last_query.get("total_count"),
+                    "question": last_query.get("question"),
+                },
+                confirmation,
+                database=db, tools=tools, task_id=task_id, events=events,
+            )
+            executed_pending = bool(forced.get("results"))
+        except Exception:
+            log.exception("sticky page continuation failed; falling back to a normal turn")
+            forced = {"results": [], "pending": None, "directive": ""}
+    elif _is_csv_request(message):
+        try:
+            bare = _is_bare_csv_request(message)
+            if bare and last_query and last_query.get("tool"):
+                tool_name = last_query["tool"]
+                base_args = dict(last_query.get("args") or {})
+                registry = {t.name: t for t in (tools or CHAT_TOOLS)}
+                if tool_name in registry:
+                    merged, keys = await _walk_pages(
+                        tool_name, base_args, database=db, registry=registry,
+                        task_id=task_id, events=events, start_offset=0, max_pages=30,
+                        unbounded=True,
+                    )
+                    items = merged.get("items") or merged.get("results") or []
+                    total_rows = len(items)
+                    date_str = periods.business_today().isoformat()
+                    if "whatsapp" in tool_name:
+                        filename = f"whatsapp-latest-{date_str}.csv"
+                    elif "payment" in tool_name:
+                        cust = base_args.get("customer") or "payments"
+                        slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(cust).lower()).strip("-")
+                        filename = f"{slug}-payments.csv" if slug != "payments" else f"payments-{date_str}.csv"
+                    elif "invoice" in tool_name:
+                        filename = f"invoices-{date_str}.csv"
+                    elif "quote" in tool_name:
+                        filename = f"quotes-{date_str}.csv"
+                    elif "lead" in tool_name:
+                        filename = f"leads-{date_str}.csv"
+                    else:
+                        filename = f"export-{date_str}.csv"
+
+                    csv_content = _format_tool_csv(tool_name, items, filename)
+                    row_label = "1 row" if total_rows == 1 else f"{total_rows} rows"
+                    deterministic_csv = (
+                        f"I have generated a CSV file with {row_label}.\n\n"
+                        f"[Download {filename}](#download:{filename})\n\n"
+                        f"```csv\n{csv_content}\n```"
+                    )
+                    merged["deterministic_csv"] = deterministic_csv
+                    merged["csv_export"] = {
+                        "filename": filename,
+                        "row_count": total_rows,
+                        "content": csv_content,
+                    }
+                    merged["is_csv_turn"] = True
+
+                    directive = (
+                        f"CSV FILE EXPORT. The user requested CSV export of the previous {tool_name} query. "
+                        f"The backend has fetched all {total_rows} matching records across all pages. "
+                        f"Produce the CSV file export response:\n"
+                        f"1. State how many rows the file contains ({row_label}). Do NOT say unfetched or later pages exist.\n"
+                        f"2. Include the file download link: [Download {filename}](#download:{filename}).\n"
+                        f"3. Provide the full CSV content inside a ```csv code block with columns matching the data.\n"
+                        f"4. Follow the company attribution rule strictly: each record's company must come only from that record; leave empty if none.\n"
+                        f"5. Mention that the user can download or view the file."
+                    )
+                    forced = {
+                        "results": [{"tool": tool_name, "result": merged, "_call_keys": keys}],
+                        "pending": None,
+                        "directive": directive,
+                        "csv_export": merged["csv_export"],
+                        "deterministic_csv": deterministic_csv,
+                    }
+                    executed_pending = True
+            elif not bare:
+                # Scoped by its own question! Check if an entity ID is specified
+                ent_match = re.search(
+                    r"\b(invoice|inv|order|quote|payment|lead)\b[^\w\d]{0,10}#?\s*([0-9a-zA-Z_-]+)",
+                    message,
+                    re.I,
+                )
+                if ent_match:
+                    ent_kind = ent_match.group(1).lower()
+                    ent_id = ent_match.group(2).strip()
+                    row = None
+                    tool_name = "get_invoices"
+                    items = []
+                    now = datetime.now(timezone.utc)
+                    if ent_kind in ("invoice", "inv", "order"):
+                        conds = [{"inv_ref": ent_id}, {"ref": ent_id}]
+                        if ent_id.isdigit():
+                            conds.append({"id": int(ent_id)})
+                        elif "-" in ent_id and ent_id.split("-")[0].isdigit():
+                            conds.append({"id": int(ent_id.split("-")[0])})
+                        row = await db.orders_flat.find_one({"$or": conds})
+                        tool_name = "get_invoices" if ent_kind != "order" else "get_orders"
+                        if row:
+                            from app.agents.chat_tools import _invoice_row
+                            items = [_invoice_row(row, now)]
+                    elif ent_kind == "quote":
+                        conds = [{"ref": ent_id}]
+                        if ent_id.isdigit():
+                            conds.append({"id": int(ent_id)})
+                        row = await db.quotes_flat.find_one({"$or": conds})
+                        tool_name = "get_quotes"
+                        if row:
+                            from app.agents.chat_tools import _quote_row
+                            items = [_quote_row(row, now)]
+                    elif ent_kind == "payment":
+                        conds = [{"payment_id": ent_id}]
+                        if ent_id.isdigit():
+                            conds.append({"id": int(ent_id)})
+                        row = await db.payments_flat.find_one({"$or": conds})
+                        tool_name = "get_payments"
+                        if row:
+                            from app.agents.chat_tools import _payment_row
+                            items = [_payment_row(row)]
+                    elif ent_kind == "lead":
+                        conds = [{"zohoLeadId": ent_id}]
+                        if ent_id.isdigit():
+                            conds.append({"id": int(ent_id)})
+                        row = await db.leads.find_one({"$or": conds})
+                        tool_name = "get_leads"
+                        if row:
+                            from app.agents.chat_tools import _lead_row
+                            items = [_lead_row(row, now)]
+
+                    if items:
+                        total_rows = len(items)
+                        row_label = "1 row" if total_rows == 1 else f"{total_rows} rows"
+                        filename = f"{ent_kind}-{ent_id}.csv"
+                        csv_content = _format_tool_csv(tool_name, items, filename)
+                        deterministic_csv = (
+                            f"I have generated a CSV file with {row_label} for {ent_kind} {ent_id}.\n\n"
+                            f"[Download {filename}](#download:{filename})\n\n"
+                            f"```csv\n{csv_content}\n```"
+                        )
+                        merged = {
+                            "items": items,
+                            "returned": total_rows,
+                            "total_count": total_rows,
+                            "has_more": False,
+                            "all_records_returned": True,
+                            "walk_complete": True,
+                            "is_csv_turn": True,
+                            "deterministic_csv": deterministic_csv,
+                            "csv_export": {
+                                "filename": filename,
+                                "row_count": total_rows,
+                                "content": csv_content,
+                            },
+                        }
+                        directive = (
+                            f"CSV FILE EXPORT. The user requested CSV export for {ent_kind} {ent_id}. "
+                            f"The backend has retrieved the matching record ({row_label}). "
+                            f"Produce the CSV file export response:\n"
+                            f"1. State how many rows the file contains ({row_label}). Do NOT say unfetched or later pages exist.\n"
+                            f"2. Include the file download link: [Download {filename}](#download:{filename}).\n"
+                            f"3. Provide the full CSV content inside a ```csv code block with columns matching the data.\n"
+                            f"4. Follow the company attribution rule strictly: each record's company must come only from that record; leave empty if none.\n"
+                            f"5. Mention that the user can download or view the file."
+                        )
+                        forced = {
+                            "results": [{"tool": tool_name, "result": merged, "_call_keys": []}],
+                            "pending": None,
+                            "directive": directive,
+                            "csv_export": merged["csv_export"],
+                            "deterministic_csv": deterministic_csv,
+                        }
+                        executed_pending = True
+        except Exception:
+            log.exception("CSV export walk failed; falling back to normal turn")
+            forced = {"results": [], "pending": None, "directive": ""}
     try:
         # A confirmed page is where the conversation now stands, so the model
         # is told that page's cursor rather than the previous one; the answer it
@@ -2452,7 +3636,7 @@ async def run_chat(
                 # context must never resurrect the action just consumed.
                 ctx = outcome.get("query_context") or {}
                 if ctx.get("recorded_at") and (
-                    ctx["recorded_at"] > (pending_previous.get("recorded_at") or "")
+                    ctx["recorded_at"] > ((pending_previous or {}).get("recorded_at") or "")
                 ):
                     new_pending = _pending_from_context(ctx)
         elif forced.get("pending") is not None:
@@ -2474,12 +3658,11 @@ async def run_chat(
         )
         if continuation_broken:
             new_pending = None
-        updated_turns = trim_turns(
-            [
-                *turns,
-                {"question": message, "answer": outcome["text"], "created_at": started, "task_id": task_id},
-            ]
-        )
+        turn_entry = {"question": message, "answer": outcome["text"], "created_at": started, "task_id": task_id}
+        if forced.get("csv_export"):
+            turn_entry["csv_export"] = forced["csv_export"]
+            outcome["csv_export"] = forced["csv_export"]
+        updated_turns = trim_turns([*turns, turn_entry])
         thread_update = {
                     "turns": updated_turns,
                     # only the bounded page record (tool, filters, cursor) - never rows

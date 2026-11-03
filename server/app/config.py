@@ -79,6 +79,18 @@ class Settings(BaseSettings):
     C360_RECENT_SYNC_MINUTES: int = 15
     C360_RECENT_PAGES: int = 3
 
+    # The WhatsApp index (customer360_whatsapp) runs on ITS OWN cadence, a
+    # separate loop and a separate subprocess launch, so neither the 5-minute
+    # signal cycle nor the c360 mirror sync is ever slowed by its detail calls.
+    # Each pass re-indexes the free cache tier and re-reads LEADS with
+    # lastActivityAt inside WHATSAPP_RECENT_DAYS (the only trustworthy message
+    # activity field); contacts/customers arrive via the cache tier or the
+    # warned --full pass. Chat tools read Mongo only, with a coverage label.
+    WHATSAPP_SYNC_ENABLED: bool = True
+    WHATSAPP_SYNC_MINUTES: int = 60
+    WHATSAPP_RECENT_DAYS: int = 14
+    WHATSAPP_SYNC_CONCURRENCY: int = 4
+
     # --- How far back the ingestion goes (YYYY-MM-DD). Default: 12 months ago ---
     INGEST_FROM: str = Field(default_factory=lambda: months_ago(12).isoformat())
 

@@ -19,6 +19,7 @@ import json
 import re
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
+from html import unescape
 from typing import Any, Iterable, Mapping, Optional
 
 from app.config import settings
@@ -204,6 +205,59 @@ def format_money_tree(value: Any) -> Any:
     if isinstance(value, list):
         return [format_money_tree(item) for item in value]
     return value
+
+
+# ---------------------------------------------------------------------------
+# CRM message bodies: readable text, never tag markup
+#
+# Zoho hands email bodies as raw HTML. The live Nov 2 briefing showed why
+# the order matters: the pipeline truncated the HTML to 200 chars WITHOUT
+# stripping first, so the stored snippets were tag soup - one was nothing
+# but opening tags with zero readable words. Strip tags, decode entities,
+# collapse whitespace, and only THEN truncate.
+# ---------------------------------------------------------------------------
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+SNIPPET_NO_READABLE_TEXT = "(message body has no readable text in the stored snippet)"
+
+
+def readable_text(value: Any, limit: int = 200) -> str:
+    """One CRM message body as readable words, capped at `limit` chars.
+
+    Idempotent on already-clean text. A fragment cut mid-tag (the stored
+    Nov 2 shape) keeps its readable words and loses the dangling markup:
+    everything from the first surviving "<" to the end is tag debris.
+    """
+    text = str(value or "")
+    if not text:
+        return ""
+    for _ in range(2):
+        stripped = unescape(_HTML_TAG_RE.sub(" ", text))
+        if stripped == text:
+            break
+        text = stripped
+    open_markup = text.find("<")
+    if open_markup != -1:
+        text = text[:open_markup]
+    return " ".join(text.split())[:limit]
+
+
+def readable_snippet(value: Any, limit: int = 200) -> Optional[str]:
+    """A stored snippet defended: cleaned text, an honest placeholder when
+    the fragment holds no readable words, None when there was nothing.
+
+    Never returns raw markup - the chat tools pass this to the model, and
+    a snippet field must not carry a "<" tag to the answer."""
+    if value is None:
+        return None
+    raw = str(value)
+    text = readable_text(raw, limit)
+    if text:
+        return text
+    if raw.strip():
+        return SNIPPET_NO_READABLE_TEXT
+    return None
 
 
 def age_days(start: Optional[datetime], now: datetime) -> Optional[float]:

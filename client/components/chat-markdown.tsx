@@ -13,7 +13,14 @@
 // renders as the literal text it is.
 
 import { Fragment, type ReactNode } from "react";
+import { Download } from "lucide-react";
 import { LeadCards } from "@/components/chat-lead-cards";
+import {
+  ChatCsvCard,
+  downloadCsvBlob,
+  findFilenameInText,
+  parseCsvRows,
+} from "@/components/chat-csv-export";
 import {
   isImportantNote,
   parseLeadAnswerItem,
@@ -29,17 +36,40 @@ function safeHref(raw: string): string | null {
   return /^(https?:|mailto:)/i.test(href) ? href : null;
 }
 
-function inlineNodes(text: string, keyBase: string): ReactNode[] {
+function inlineNodes(text: string, keyBase: string, csvData?: string): ReactNode[] {
   const parts = text.split(INLINE_RE).filter((part) => part !== "" && part !== undefined);
   return parts.map((part, index) => {
     const key = `${keyBase}-${index}`;
     const link = /^\[([^\]]+)\]\(([^)\s]+)\)$/.exec(part);
     if (link) {
-      const href = safeHref(link[2]);
+      const label = link[1];
+      const target = link[2].trim();
+      if (target.startsWith("#download:") || target.endsWith(".csv")) {
+        const filename = target.startsWith("#download:") ? target.slice(10) : target;
+        return (
+          <a
+            key={key}
+            href={`#download:${filename}`}
+            onClick={(e) => {
+              e.preventDefault();
+              if (csvData) {
+                downloadCsvBlob(filename, csvData);
+              }
+            }}
+            className="cmd-link font-medium inline-flex items-center gap-1 text-accent hover:underline"
+            title={`Download ${filename}`}
+            data-testid="csv-download-link"
+          >
+            <Download size={11} aria-hidden="true" />
+            {label}
+          </a>
+        );
+      }
+      const href = safeHref(target);
       if (!href) return <Fragment key={key}>{part}</Fragment>;
       return (
         <a key={key} href={href} target="_blank" rel="noreferrer noopener" className="cmd-link">
-          {link[1]}
+          {label}
         </a>
       );
     }
@@ -70,6 +100,8 @@ const isTableSeparator = (line: string) => /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(lin
 export function ChatMarkdown({ text }: { text: string }) {
   const lines = (text ?? "").replace(/\r\n/g, "\n").split("\n");
   const blocks: ReactNode[] = [];
+  const csvMatch = /```(?:csv)?\s*\n([\s\S]*?)```/i.exec(text ?? "");
+  const extractedCsv = csvMatch ? csvMatch[1].trim() : "";
 
   // The lead-list shape is read before rendering so a message that carries
   // leads can never be split into cards by accident: every line is checked
@@ -149,7 +181,7 @@ export function ChatMarkdown({ text }: { text: string }) {
         }
         pendingNotes.push(
           <aside className="cmd-callout" role="note" key={`note-${index}`}>
-            {inlineNodes(body.join(" "), `note${index}`)}
+            {inlineNodes(body.join(" "), `note${index}`, extractedCsv)}
           </aside>,
         );
         continue;
@@ -160,15 +192,40 @@ export function ChatMarkdown({ text }: { text: string }) {
     const fence = /^```([^\n]*)$/.exec(line.trim());
     if (fence) {
       const body: string[] = [];
+      const lang = (fence[1] || "").trim().toLowerCase();
       index += 1;
       while (index < lines.length && !/^```\s*$/.test(lines[index].trim())) {
         body.push(lines[index]);
         index += 1;
       }
       index += 1;
+      const joined = body.join("\n");
+      const isCsv =
+        lang === "csv" ||
+        (body.length >= 2 &&
+          body[0].includes(",") &&
+          (body[0].startsWith("Name,") ||
+            body[0].startsWith('"Name"') ||
+            body[0].includes("Record Type") ||
+            body[0].includes("Payment") ||
+            body[0].includes("Date")));
+      if (isCsv) {
+        const fn =
+          findFilenameInText(text) ||
+          `export-${new Date().toISOString().slice(0, 10)}.csv`;
+        push(
+          <ChatCsvCard
+            key={`csv-${blocks.length}`}
+            filename={fn}
+            content={joined}
+            rowCount={parseCsvRows(joined)}
+          />,
+        );
+        continue;
+      }
       push(
         <pre className="cmd-pre">
-          <code>{body.join("\n")}</code>
+          <code>{joined}</code>
         </pre>,
       );
       continue;
@@ -269,6 +326,30 @@ export function ChatMarkdown({ text }: { text: string }) {
       index += 1;
     }
 
+    // Raw CSV table block (e.g. un-fenced CSV rows with header).
+    const isCsvHeader = (l: string) =>
+      l.includes(",") &&
+      (l.startsWith("Name,") ||
+        l.startsWith('"Name",') ||
+        l.includes("Record Type,") ||
+        l.includes("Payment,") ||
+        l.includes("Date,"));
+    if (paragraph.length >= 2 && isCsvHeader(paragraph[0])) {
+      const csvText = paragraph.join("\n");
+      const fn =
+        findFilenameInText(text) ||
+        `export-${new Date().toISOString().slice(0, 10)}.csv`;
+      push(
+        <ChatCsvCard
+          key={`csv-${blocks.length}`}
+          filename={fn}
+          content={csvText}
+          rowCount={parseCsvRows(csvText)}
+        />,
+      );
+      continue;
+    }
+
     // Record lines written as "A | field: value | field: value" are common
     // for invoices and payments. They are not lead cards, but one record per
     // row with real spacing is the readable prose fallback.
@@ -296,7 +377,7 @@ export function ChatMarkdown({ text }: { text: string }) {
         flushRecords();
         push(
           <p className="cmd-p">
-            {inlineNodes(part, `p${index}-${partIndex}`)}
+            {inlineNodes(part, `p${index}-${partIndex}`, extractedCsv)}
           </p>,
         );
       });
@@ -309,7 +390,7 @@ export function ChatMarkdown({ text }: { text: string }) {
         {paragraph.map((part, partIndex) => (
           <Fragment key={partIndex}>
             {partIndex > 0 && <br />}
-            {inlineNodes(part, `p${index}-${partIndex}`)}
+            {inlineNodes(part, `p${index}-${partIndex}`, extractedCsv)}
           </Fragment>
         ))}
       </p>,

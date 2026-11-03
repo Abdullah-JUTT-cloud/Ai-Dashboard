@@ -161,13 +161,31 @@ async def get_stuck_leads(
 
 @router.get("/briefing/latest")
 async def latest_briefing() -> dict:
-    """Latest agent run: master brief + the sub-agent items it is built from."""
-    cursor = get_db().agent_runs.find().sort("started_at", -1)
-    docs = await cursor.to_list(1)
-    if not docs:
-        return {"run_id": None, "message": "no agent run yet - POST /api/agents/run first"}
-    doc = docs[0]
+    """Latest FINISHED agent run: master brief + the sub-agent items it is built from.
+
+    agent_runs also carries "running" and "failed" documents that hold
+    started_at/status but no sections. Serving one as "the latest" made
+    the review page read briefing.negotiation on a section-less doc
+    (live Nov 2 runtime TypeError), so the newest saved run is picked
+    instead; the newest stub is reported alongside, never as a briefing.
+    """
+    from app.services.crm_digest import latest_finished_run
+
+    doc, pending = await latest_finished_run(get_db())
+    if doc is None:
+        payload: dict = {
+            "run_id": None,
+            "message": "no agent run yet - POST /api/agents/run first",
+        }
+        if pending is not None:
+            payload["latest_run_status"] = str(pending.get("status") or "running")
+            payload["latest_run_id"] = pending.get("run_id")
+        return payload
+    doc = dict(doc)
     doc.pop("_id", None)
+    if pending is not None:
+        doc["newer_run_status"] = str(pending.get("status") or "running")
+        doc["newer_run_id"] = pending.get("run_id")
     # the CRM morning digest rides the briefing: yesterday's CRM
     # payments + who is waiting + stalled deals, computed locally.
     # A digest failure must never take the briefing down with it.

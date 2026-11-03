@@ -21,6 +21,7 @@ from app.config import settings
 from app.services import customer360 as c360_service
 from app.services import customer360_index as c360_index
 from app.services import metrics, periods, processors
+from app.services.crm_digest import format_human_timestamp
 from app.services.customer360_client import Customer360Client, Customer360Error
 
 log = logging.getLogger("chat_tools")
@@ -117,12 +118,11 @@ class PeriodMixin(BaseModel):
         if self.date_from is not None or self.date_to is not None:
             raise ValueError("period and an explicit date_from/date_to cannot be combined - use one")
         try:
-            # Relative dates are read on the user's calendar (Asia/Karachi):
-            # when the user in Lahore says "today" at 7 AM, the ERP's US
-            # business day is still yesterday, and answering with the ERP
-            # date while calling it "today" mislabels the data.
+            # Named periods in the chat path resolve on the ERP business
+            # calendar (America/Chicago), matching the dashboard tiles and
+            # golden P1 (Item E decision authorized by user prompt).
             start, end = periods.resolve_period(
-                raw, today=datetime.now(processors.USER_TZ).date()
+                raw, today=periods.business_today()
             )
         except KeyError:
             raise ValueError(
@@ -225,21 +225,21 @@ def _page_metadata(offset: int, limit: int, total: int, delivered: int) -> dict:
     """
     next_offset = offset + delivered
     has_more = next_offset < total
-    # A page that starts past the end delivered nothing and covered nothing, so
-    # it cannot testify that the whole set was returned - even though there is
-    # genuinely nothing left to fetch from that offset. Only a page that begins
-    # inside (or exactly at the end of) the result set can close the walk. An
-    # empty result set still counts: offset 0 of total 0 covered everything.
     covers_the_set = not has_more and offset <= total
-    # "page 1 of 7" is arithmetic over the page contract, and the model may only
-    # write numbers the backend computed - so the backend does this dividing too.
-    # The divisor is the number of rows a page actually carried (``delivered``),
-    # not the size that was asked for: a page the context budget trimmed from 50
-    # to 28 really is one of ceil(29/28)=2 pages, and calling it "1 of 1" while a
-    # row still remained told the model the walk was over when it was not.
-    effective_page = delivered if delivered else (limit or 1)
+    divisor = limit if limit else 1
+    if delivered < limit and has_more and delivered > 0:
+        effective_page = delivered
+    else:
+        effective_page = divisor
     pages_total = max(1, -(-total // effective_page)) if total else 1
-    page = min(pages_total, (offset // effective_page) + 1) if effective_page else 1
+
+    past_end = total > 0 and offset >= total and delivered == 0
+    if past_end:
+        # Past-the-end: empty page with note, NO row-implying page number
+        page = None
+    else:
+        page = (offset // effective_page) + 1
+
     metadata = {
         "offset": offset,
         "limit": limit,
@@ -251,11 +251,14 @@ def _page_metadata(offset: int, limit: int, total: int, delivered: int) -> dict:
         "all_records_returned": covers_the_set,
         "page": page,
         "pages_total": pages_total,
+        "page_size": effective_page,
     }
-    if delivered < limit and has_more:
-        # the page came back shorter than asked: say why, and what to ask for
+    if delivered < limit and has_more and delivered > 0:
         metadata["page_shorter_than_requested"] = True
         metadata["suggested_limit"] = delivered
+        metadata["page_display"] = (
+            f"{delivered} shown of {total} (page {page} of {pages_total}, {effective_page} rows per page)"
+        )
     return metadata
 
 
@@ -386,21 +389,42 @@ def _name_score(query: str, candidate: str) -> float:
 
 
 async def get_latest_briefing(database: Any = None) -> dict:
+    """The master brief of the latest FINISHED run.
+
+    A running or failed agent_runs document carries no sections, so it
+    is skipped: the brief comes from the newest saved run, or the tool
+    says plainly that no finished run exists yet."""
+    from app.services.crm_digest import latest_finished_run
+
     EmptyArgs.model_validate({})
-    rows = await _database(database).agent_runs.find().sort("started_at", -1).to_list(1)
-    if not rows:
-        return {"run_id": None, "message": "No agent briefing is available."}
-    row = rows[0]
-    master = row.get("master") or {}
-    return _bounded(
+    run, pending = await latest_finished_run(_database(database))
+    if run is None:
+        return {
+            "run_id": None,
+            "available": False,
+            "reason": "no_finished_run",
+            "latest_run_status": (
+                str(pending.get("status") or "running") if pending is not None else None
+            ),
+            "message": (
+                "No finished agent run yet - the briefing needs a run first. "
+                "Start one from the Run agents button (or wait for the 6 AM daily run)."
+            ),
+        }
+    master = run.get("master") or {}
+    result = _bounded(
         {
-            "run_id": row.get("run_id"),
-            "started_at": row.get("started_at"),
+            "run_id": run.get("run_id"),
+            "available": True,
+            "started_at": run.get("started_at"),
             "briefing": master.get("bullets", []),
             "priorities": master.get("priorities", []),
             "conflicts_resolved": master.get("conflicts_resolved", []),
         }
     )
+    if pending is not None:
+        result["newer_run_status"] = str(pending.get("status") or "running")
+    return result
 
 
 async def get_signals_summary(database: Any = None) -> dict:
@@ -798,6 +822,9 @@ PAGING_NOTE = (
     " Paged: the answer gives offset, limit, total_count, returned, remaining_count, has_more,"
     " next_offset and the page position (page, pages_total). To continue the same query, re-call it"
     " with identical filters and offset=next_offset."
+    " pages_total divides total_count by page_size - the rows a page really carried, which the"
+    " context budget may trim below limit: when page_shorter_than_requested is true describe the page"
+    " with returned and total_count (for example '26 shown of 202'), never limit beside pages_total."
     " Never say you listed every record while has_more is true, and never add up rows yourself - report the"
     " counts exactly as the tool returned them."
 )
@@ -871,6 +898,42 @@ class RowsArgs(ToolArgs):
     @classmethod
     def cap_rows(cls, value: int) -> int:
         return min(value, MAX_TOOL_ROWS)
+
+
+class WhatsAppLatestArgs(RowsArgs):
+    """The WhatsApp latest-messages listing's real filters (live Nov 2: the
+    model offered direction/date filters that did not exist yet - they do
+    now, as plain predicates over the indexed rows, so the offer is honest)."""
+
+    direction: str | None = Field(
+        default=None,
+        description="Only rows whose latest WhatsApp message has this direction: 'Inbound' (from the "
+        "customer) or 'Outbound' (from the team). Omit it, or pass 'all', for every row.",
+    )
+    date_from: date | None = Field(
+        default=None,
+        description="Only rows whose latest WhatsApp message arrived on or after this date (inclusive).",
+    )
+    date_to: date | None = Field(
+        default=None,
+        description="Only rows whose latest WhatsApp message arrived on or before this date (inclusive).",
+    )
+
+    @field_validator("direction", mode="before")
+    @classmethod
+    def _normalize_direction(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            cleaned = value.strip().lower()
+            if cleaned in ("", "all", "any"):
+                return None
+            return {"inbound": "Inbound", "outbound": "Outbound"}.get(cleaned, value.strip())
+        return value
+
+    @model_validator(mode="after")
+    def _dates_are_ordered(self):
+        if self.date_from and self.date_to and self.date_from > self.date_to:
+            raise ValueError("date_from must be on or before date_to")
+        return self
 
 
 class DateFilterArgs(PeriodMixin, RowsArgs):
@@ -1046,7 +1109,10 @@ def _customer_id_of(row: dict) -> Any:
 
 
 def _customer_name_of(row: dict) -> str:
-    return str((row.get("customer") or {}).get("company_name") or "").strip()
+    customer = row.get("customer") or {}
+    if isinstance(customer, dict):
+        return str(customer.get("company_name") or customer.get("name") or "").strip()
+    return str(customer).strip()
 
 
 def _in_window(value: Any, date_from: date | None, date_to: date | None) -> bool:
@@ -1304,6 +1370,12 @@ def _invoice_row(row: dict, now: datetime) -> dict:
     paid = processors.to_number(row.get("amount_paid"))
     age = processors.age_days(processors.parse_date(row.get("invoice_date")), now) or 0.0
     days_age = int(age)
+    days_over = _days_overdue(days_age)
+    overdue_lbl = (
+        "0 days past 30-day terms (due today / first day overdue)"
+        if days_over == 0
+        else f"{days_over} days overdue"
+    )
     return {
         "invoice_id": row.get("id"),
         "invoice_number": row.get("inv_ref"),
@@ -1318,7 +1390,8 @@ def _invoice_row(row: dict, now: datetime) -> dict:
         "due_date": row.get("due_date"),
         "days_invoice_age": days_age,
         "overdue": bool(age > settings.OVERDUE_INVOICE_DAYS),
-        "days_overdue": _days_overdue(days_age),
+        "days_overdue": days_over,
+        "days_overdue_label": overdue_lbl,
         "sale_rep": str((processors.sale_rep_ref(row) or {}).get("name") or ""),
     }
 
@@ -1401,6 +1474,22 @@ async def get_invoices(
     return result
 
 
+def _quote_row(row: dict, now: datetime) -> dict:
+    age = processors.age_days(processors.parse_date(row.get("created_at")), now) or 0.0
+    return {
+        "quote_id": row.get("id"),
+        "ref": row.get("ref"),
+        "customer_id": _customer_id_of(row),
+        "customer_name": _customer_name_of(row) or "Customer not recorded",
+        "amount": processors.to_number(row.get("amount")),
+        "status": row.get("status"),
+        "created_at": row.get("created_at"),
+        "age_days": round(age, 1),
+        "days_stale": int(age),
+        "sale_rep": str((processors.sale_rep_ref(row) or {}).get("name") or ""),
+    }
+
+
 async def get_quotes(
     status: str | None = None,
     customer: str | None = None,
@@ -1454,21 +1543,7 @@ async def get_quotes(
                 continue
             if wanted_id is not None and not _same_id(_customer_id_of(row), wanted_id):
                 continue
-            age = processors.age_days(processors.parse_date(row.get("created_at")), now) or 0.0
-            matched.append(
-                {
-                    "quote_id": row.get("id"),
-                    "ref": row.get("ref"),
-                    "customer_id": _customer_id_of(row),
-                    "customer_name": _customer_name_of(row) or "Customer not recorded",
-                    "amount": processors.to_number(row.get("amount")),
-                    "status": row.get("status"),
-                    "created_at": row.get("created_at"),
-                    "age_days": round(age, 1),
-                    "days_stale": int(age),
-                    "sale_rep": str((processors.sale_rep_ref(row) or {}).get("name") or ""),
-                }
-            )
+            matched.append(_quote_row(row, now))
 
     # quote_id tiebreaker: equal amounts must not shuffle between pages
     matched.sort(key=lambda item: (item["amount"], str(item["quote_id"])), reverse=True)
@@ -1556,6 +1631,47 @@ async def get_orders(
     return result
 
 
+def _lead_row(row: dict, now: datetime, stuck: bool | None = None) -> dict:
+    lead_id = str(row.get("zohoLeadId") or "")
+    parsed = processors.parse_lead_description(row.get("description"))
+    contact_name = " ".join(
+        part for part in (str(row.get("firstName") or ""), str(row.get("lastName") or "")) if part
+    ) or None
+    missing_fields = processors.missing_lead_fields(parsed)
+    idle_days = processors.age_days(
+        processors.parse_date(row.get("lastActivityAt"))
+        or processors.parse_date(row.get("createdAt")),
+        now,
+    )
+    item = {
+        "lead_id": lead_id,
+        "contact_name": contact_name,
+        "company": str(row.get("company") or "") or None,
+        "status": str(row.get("status") or ""),
+        "source": str(row.get("source") or "") or None,
+        "created_at": processors.iso_or_none(row.get("createdAt")),
+        "last_activity_at": processors.iso_or_none(row.get("lastActivityAt")),
+        "days_since_activity": idle_days,
+        "product": parsed.get("product") or parsed.get("type"),
+        "quantity": parsed.get("quantity"),
+        "size": parsed.get("size"),
+        "material": parsed.get("material"),
+        "finish": parsed.get("finish"),
+        "missing": missing_fields,
+        "artwork": _ARTWORK_LABELS[parsed.get("artwork_present")],
+        "next_action": processors.lead_next_action(
+            missing_fields,
+            contact_name,
+            artwork_present=parsed.get("artwork_present"),
+            description_shape=parsed.get("shape"),
+        ),
+        "stuck": stuck,
+    }
+    if item["days_since_activity"] is not None:
+        item["days_since_activity"] = round(item["days_since_activity"], 1)
+    return item
+
+
 async def get_leads(
     status: str | None = None,
     stuck_only: bool = False,
@@ -1582,49 +1698,8 @@ async def get_leads(
             continue
         if args.status and args.status.casefold() not in str(row.get("status") or "").casefold():
             continue
-        parsed = processors.parse_lead_description(row.get("description"))
-        contact_name = " ".join(
-            part for part in (str(row.get("firstName") or ""), str(row.get("lastName") or "")) if part
-        ) or None
-        missing_fields = processors.missing_lead_fields(parsed)
-        idle_days = processors.age_days(
-            processors.parse_date(row.get("lastActivityAt"))
-            or processors.parse_date(row.get("createdAt")),
-            now,
-        )
-        item = {
-            "lead_id": lead_id,
-            "contact_name": contact_name,
-            "company": str(row.get("company") or "") or None,
-            "status": str(row.get("status") or ""),
-            "source": str(row.get("source") or "") or None,
-            "created_at": processors.iso_or_none(row.get("createdAt")),
-            "last_activity_at": processors.iso_or_none(row.get("lastActivityAt")),
-            "days_since_activity": idle_days,
-            "product": parsed.get("product") or parsed.get("type"),
-            "quantity": parsed.get("quantity"),
-            "size": parsed.get("size"),
-            "material": parsed.get("material"),
-            "finish": parsed.get("finish"),
-            "missing": missing_fields,
-            "artwork": _ARTWORK_LABELS[parsed.get("artwork_present")],
-            "next_action": processors.lead_next_action(
-                missing_fields,
-                contact_name,
-                artwork_present=parsed.get("artwork_present"),
-                description_shape=parsed.get("shape"),
-            ),
-            # No conversion_reason here, deliberately: get_leads pages
-            # must match get_stuck_leads row-for-row (the continuation
-            # anchor cannot tell the views apart by count), and the tool
-            # response is hard-capped at ~10,500 chars - one more
-            # sentence per row trims rows off the page. The reason lives
-            # on get_stuck_leads, the stuck-lead view; get_leads still
-            # carries the artwork state and the corrected next_action.
-            "stuck": lead_id in stuck_ids if args.stuck_only else None,
-        }
-        if item["days_since_activity"] is not None:
-            item["days_since_activity"] = round(item["days_since_activity"], 1)
+        stuck_val = lead_id in stuck_ids if args.stuck_only else None
+        item = _lead_row(row, now, stuck=stuck_val)
         if args.search and not _text_matches({"item": item}, args.search):
             continue
         matched.append(item)
@@ -2145,16 +2220,47 @@ async def get_customer360_analysis(
 async def get_crm_follow_up_queue(database: Any = None) -> dict:
     """Who is waiting for a reply - the CRM Engagement agent's queue.
 
-    Reads the LATEST agent run's crm_engagement section: the same
-    Python-computed items the review page shows (their last interaction
-    was inbound and unanswered), each with the channel the customer is
-    waiting on and their actual last words. No live CRM call: freshness
-    is the run's own started_at, returned as as_of so the answer can
-    date itself honestly. WhatsApp sorts first - the channel the team
+    Reads the latest FINISHED agent run's crm_engagement section: the
+    same Python-computed items the review page shows (their last
+    interaction was inbound and unanswered), each with the channel the
+    customer is waiting on and their actual last words. The "running"
+    and "failed" documents agent_runs also carries hold no sections -
+    reading one as the latest run made an in-progress run look like an
+    empty queue (live Nov 2), so they are skipped and the real state is
+    reported: available=false with reason no_finished_run when no
+    finished run exists. No live CRM call: freshness is the finished
+    run's own started_at, returned as as_of so the answer can date
+    itself honestly. WhatsApp sorts first - the channel the team
     answers fastest - then the longest wait."""
+    from app.services.crm_digest import latest_finished_run
+
     db = _database(database)
-    run = await db.agent_runs.find_one({}, sort=[("started_at", -1)])
-    items = (run or {}).get("crm_engagement") or []
+    run, pending = await latest_finished_run(db)
+    if run is None:
+        note = (
+            "An agent run is already in progress; the queue is computed when "
+            "a run finishes. Say that plainly - state no waiting count."
+            if pending is not None and str(pending.get("status") or "").lower() == "running"
+            else (
+                "No finished agent run yet - the follow-up queue is computed by "
+                "an agent run. Start one from the Run agents button (or wait for "
+                "the 6 AM daily run). Say that plainly - state no waiting count."
+            )
+        )
+        result = {
+            "source": "crm_follow_up_queue",
+            "available": False,
+            "reason": "no_finished_run",
+            "as_of": None,
+            "waiting_total": None,
+            "by_channel": {},
+            "queue": [],
+            "note": note,
+        }
+        if pending is not None:
+            result["latest_run_status"] = str(pending.get("status") or "running")
+        return result
+    items = run.get("crm_engagement") or []
     queue: list[dict] = []
     for item in items:
         if not isinstance(item, dict) or item.get("error"):
@@ -2165,7 +2271,12 @@ async def get_crm_follow_up_queue(database: Any = None) -> dict:
                 "company": item.get("company"),
                 "channel": item.get("channel"),
                 "waiting_days": item.get("waiting_days"),
-                "last_customer_message": item.get("last_customer_message"),
+                # runs saved before the Nov 2 strip-at-source fix carry
+                # 200-char HTML fragments: defend the stored snippet here
+                # too, so no raw tag ever reaches the model
+                "last_customer_message": processors.readable_snippet(
+                    item.get("last_customer_message")
+                ),
             }
         )
     queue.sort(
@@ -2175,13 +2286,204 @@ async def get_crm_follow_up_queue(database: Any = None) -> dict:
     for row in queue:
         if row["channel"]:
             by_channel[row["channel"]] = by_channel.get(row["channel"], 0) + 1
-    return {
+    as_of_iso = run.get("started_at")
+    as_of_human = format_human_timestamp(as_of_iso) if as_of_iso else None
+    previous_waiting = None
+    previous_as_of = None
+    if len(queue) == 0:
+        try:
+            candidates = await db.agent_runs.find(
+                {"_id": {"$ne": run.get("_id")}, "status": None},
+            ).sort("started_at", -1).to_list(10)
+            from app.services.crm_digest import is_finished_run
+            for cand in candidates or []:
+                if is_finished_run(cand):
+                    prev_items = [
+                        it for it in (cand.get("crm_engagement") or [])
+                        if isinstance(it, dict) and not it.get("error")
+                    ]
+                    if prev_items:
+                        previous_waiting = len(prev_items)
+                        previous_as_of = format_human_timestamp(cand.get("started_at"))
+                        break
+        except Exception:
+            pass
+
+    result = {
         "source": "crm_follow_up_queue",
-        "as_of": (run or {}).get("started_at"),
+        "available": True,
+        "run_status": "finished",
+        "as_of": as_of_iso,
+        "as_of_human": as_of_human,
         "waiting_total": len(queue),
         "by_channel": by_channel,
         "queue": queue[:10],
     }
+    if previous_waiting is not None:
+        result["previous_run_waiting"] = previous_waiting
+        result["previous_run_as_of"] = previous_as_of
+        result["note"] = f"No one waiting in the latest run (previous run had {previous_waiting} waiting)."
+    if pending is not None:
+        result["newer_run_status"] = str(pending.get("status") or "running")
+        result["note"] = (
+            "A newer agent run is still in progress; this queue is from the "
+            "latest finished run (" + str(as_of_human or as_of_iso) + ")."
+        )
+    return result
+
+
+async def get_whatsapp_latest_messages(
+    limit: int = DEFAULT_TOOL_ROWS,
+    offset: int = 0,
+    direction: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    database: Any = None,
+) -> dict:
+    """Every person's latest WhatsApp message, newest first, from the local index.
+
+    Reads customer360_whatsapp only - NO live CRM call (the CRM has no
+    messages endpoint; probed live Nov 2), so a chat turn can never hang on
+    a detail sweep. The index is bounded and the result says so: the
+    coverage block names exactly how far it reaches, and a partial index is
+    never presented as "all". Real filters: direction (Inbound/Outbound)
+    and the latest-message date range - offer these, nothing else."""
+    from app.services import whatsapp_index
+
+    args = WhatsAppLatestArgs.model_validate({
+        "limit": limit, "offset": offset, "direction": direction,
+        "date_from": date_from, "date_to": date_to,
+    })
+    db = _database(database)
+    collection = getattr(db, whatsapp_index.WHATSAPP_COLLECTION, None)
+    rows: list[dict] = []
+    if collection is not None:
+        try:
+            rows = await collection.find({}).to_list(20_000)
+        except Exception:
+            rows = []
+    rows = [
+        row for row in rows
+        if isinstance(row, dict) and int(row.get("whatsapp_count") or 0) > 0
+    ]
+    if args.direction:
+        rows = [
+            row for row in rows
+            if str(row.get("latest_direction") or "").casefold() == args.direction.casefold()
+        ]
+    if args.date_from:
+        rows = [row for row in rows if str(row.get("latest_at") or "")[:10] >= args.date_from.isoformat()]
+    if args.date_to:
+        rows = [row for row in rows if str(row.get("latest_at") or "")[:10] <= args.date_to.isoformat()]
+    rows.sort(key=lambda row: (str(row.get("latest_at") or ""), str(row.get("_id") or "")), reverse=True)
+    page = rows[args.offset : args.offset + args.limit]
+    items = [
+        {
+            "name": row.get("name"),
+            "record_type": row.get("record_type"),
+            "company": row.get("company"),
+            "latest_text": row.get("latest_text"),
+            "latest_at": row.get("latest_at"),
+            "latest_direction": row.get("latest_direction"),
+        }
+        for row in page
+    ]
+    cover = await whatsapp_index.coverage(db)
+    filters_applied = {
+        key: value.isoformat() if isinstance(value, date) else value
+        for key, value in (
+            ("direction", args.direction),
+            ("date_from", args.date_from),
+            ("date_to", args.date_to),
+        )
+        if value is not None
+    }
+    payload: dict = {
+        "source": "whatsapp_index",
+        "items": items,
+        "coverage": cover,
+        "note": (
+            "The WhatsApp index is empty - no person records have been "
+            "indexed yet, so no message list exists. Say that plainly; "
+            "the index pass runs hourly (run_whatsapp_index.py)."
+            if cover["indexed_records"] == 0 else
+            whatsapp_index.coverage_label(cover)
+        ),
+    }
+    if filters_applied:
+        payload["filters_applied"] = filters_applied
+    result = _paginate(
+        _bounded(payload),
+        total=len(rows),
+        offset=args.offset,
+        limit=args.limit,
+    )
+    if args.offset and not result["items"]:
+        result["note"] = "That offset is past the end of this result set; nothing more to fetch."
+    return result
+
+
+async def get_whatsapp_top_contacts(
+    limit: int = DEFAULT_TOOL_ROWS,
+    offset: int = 0,
+    database: Any = None,
+) -> dict:
+    """People ranked by WhatsApp message count, most first, from the local index.
+
+    Same contract as the latest-messages tool: Mongo only, no live CRM call,
+    and the coverage block names exactly how far the index reaches."""
+    from app.services import whatsapp_index
+
+    args = RowsArgs.model_validate({"limit": limit, "offset": offset})
+    db = _database(database)
+    collection = getattr(db, whatsapp_index.WHATSAPP_COLLECTION, None)
+    rows: list[dict] = []
+    if collection is not None:
+        try:
+            rows = await collection.find({}).to_list(20_000)
+        except Exception:
+            rows = []
+    rows = [
+        row for row in rows
+        if isinstance(row, dict) and int(row.get("whatsapp_count") or 0) > 0
+    ]
+    rows.sort(key=lambda row: (
+        -int(row.get("whatsapp_count") or 0),
+        str(row.get("latest_at") or ""),
+        str(row.get("_id") or ""),
+    ))
+    page = rows[args.offset : args.offset + args.limit]
+    items = [
+        {
+            "name": row.get("name"),
+            "record_type": row.get("record_type"),
+            "company": row.get("company"),
+            "whatsapp_count": int(row.get("whatsapp_count") or 0),
+            "latest_at": row.get("latest_at"),
+        }
+        for row in page
+    ]
+    cover = await whatsapp_index.coverage(db)
+    result = _paginate(
+        _bounded({
+            "source": "whatsapp_index",
+            "items": items,
+            "coverage": cover,
+            "note": (
+                "The WhatsApp index is empty - no person records have been "
+                "indexed yet, so no ranking exists. Say that plainly; the "
+                "index pass runs hourly (run_whatsapp_index.py)."
+                if cover["indexed_records"] == 0 else
+                whatsapp_index.coverage_label(cover)
+            ),
+        }),
+        total=len(rows),
+        offset=args.offset,
+        limit=args.limit,
+    )
+    if args.offset and not result["items"]:
+        result["note"] = "That offset is past the end of this result set; nothing more to fetch."
+    return result
 
 
 async def get_crm_morning_briefing(database: Any = None) -> dict:
@@ -2201,11 +2503,20 @@ async def get_record(collection: str, id: str, database: Any = None) -> dict:
     args = RecordArgs.model_validate({"collection": collection, "id": id})
     db = _database(database)
     name = RECORD_COLLECTIONS[args.collection]
+    col = getattr(db, name, None) if hasattr(db, name) else db[name]
     key = "zohoLeadId" if name == "leads" else "id"
     value: Any = args.id.strip()
     if key == "id" and re.fullmatch(r"\d+", value):
         value = int(value)
-    rows = await db[name].find({key: value}, {"_id": 0}).to_list(1)
+    rows = await col.find({key: value}, {"_id": 0}).to_list(1)
+    if not rows and key == "id":
+        conds = [{"inv_ref": str(value)}, {"ref": str(value)}]
+        str_val = str(value)
+        if str_val.isdigit():
+            conds.append({"id": int(str_val)})
+        elif "-" in str_val and str_val.split("-")[0].isdigit():
+            conds.append({"id": int(str_val.split("-")[0])})
+        rows = await col.find({"$or": conds}, {"_id": 0}).to_list(1)
     if not rows:
         return {
             "collection": args.collection,
@@ -2223,6 +2534,28 @@ async def get_record(collection: str, id: str, database: Any = None) -> dict:
         if stamp["timestamp_precision"] != "instant":
             record.pop("received_at", None)
         record.update(stamp)
+    elif args.collection in ("invoices", "orders"):
+        now = datetime.now(timezone.utc)
+        total = processors.to_number(record.get("total_amount"))
+        paid = processors.to_number(record.get("amount_paid"))
+        balance = round(total - paid, 2)
+        inv_date = record.get("invoice_date")
+        age = processors.age_days(processors.parse_date(inv_date), now) or 0.0
+        days_age = int(age)
+        days_over = _days_overdue(days_age)
+        is_overdue = bool(balance > 0 and days_age >= settings.OVERDUE_INVOICE_DAYS)
+        overdue_lbl = (
+            "0 days past 30-day terms (due today / first day overdue)"
+            if days_over == 0
+            else f"{days_over} days overdue"
+        )
+        record["balance"] = balance
+        record["days_invoice_age"] = days_age
+        record["overdue"] = is_overdue
+        record["days_overdue"] = days_over
+        record["days_overdue_label"] = overdue_lbl
+        if inv_date:
+            record["invoice_date_human"] = format_human_timestamp(inv_date)
     return {
         "collection": args.collection,
         "id": args.id,
@@ -3081,7 +3414,7 @@ async def recall_conversations(query: str = "", limit: int = 5, database: Any = 
 
 
 CHAT_TOOLS = [
-    ChatTool("get_latest_briefing", "Get the latest saved Master brief and its priorities.", EmptyArgs, get_latest_briefing),
+    ChatTool("get_latest_briefing", "Get the latest saved Master brief and its priorities. The brief comes from the latest FINISHED agent run; running and failed runs are skipped. When it returns available=false with reason no_finished_run, say plainly: no finished agent run yet - the briefing needs a run first; start one from the Run agents button or wait for the 6 AM daily run. State no figures from an unavailable brief.", EmptyArgs, get_latest_briefing),
     ChatTool(
         "get_dashboard_metrics",
         "Get the same pre-computed dashboard metrics the UI shows: revenue today (ERP business day), month to date, last 7 days, payments count today, open quotes, unpaid and overdue totals. Use this for 'today's revenue', 'this month', 'last 7 days' and any dashboard KPI question instead of passing a local date to get_revenue.",
@@ -3103,19 +3436,19 @@ CHAT_TOOLS = [
     ),
     ChatTool(
         "get_payments",
-        "THE payments tool: ERP payment records (who paid), for any question about payments received - today, this week, this month, last month, or from a customer. One call: a named period resolves on the ERP business calendar (the same day the revenue tile reports), and a customer with no period scans all time. Sets that fit one page come back whole; larger sets page, one call per page (re-call with offset set to the previous page's next_offset). Report the summary total first, then the rows. Filters: received-date range, customer name or ID, min/max amount. Answer 'who paid today' with this tool." + PAGING_NOTE,
+        "THE payments tool: ERP payment records (who paid), for any question about payments received - today, this week, this month, last month, or from a customer. Answer EVERY payments question with this tool, including one that names the CRM ('Show me X's CRM payments'): the ERP is the only payments ledger, the CRM has no separate one to check or retry. If a CRM lookup failed or timed out, call this tool anyway and report the ERP total - never end a payments question with a choice between retrying the CRM and pulling the ERP. One call: a named period resolves on the ERP business calendar (the same day the revenue tile reports), and a customer with no period scans all time. Sets that fit one page come back whole; larger sets page, one call per page (re-call with offset set to the previous page's next_offset). Report the summary total first, then the rows. Filters: received-date range, customer name or ID, min/max amount. Answer 'who paid today' with this tool." + PAGING_NOTE,
         PaymentArgs,
         get_payments,
     ),
     ChatTool(
         "get_invoices",
-        "List invoices with balance, due date, days overdue and customer. Filters: payment status text, customer, overdue_only, invoice-date range." + PAGING_NOTE,
+        "List invoices with balance, due date, days overdue and customer - every invoices question is answered from this ERP tool, even one that names the CRM. Filters: payment status text, customer, overdue_only, invoice-date range." + PAGING_NOTE,
         InvoiceArgs,
         get_invoices,
     ),
     ChatTool(
         "get_quotes",
-        "List quotes with amount, status, age and customer. Filters: status text, customer, stale_only (the same open-quote rules the dashboard uses), created-date range." + PAGING_NOTE,
+        "List quotes with amount, status, age and customer - every quotes question is answered from this ERP tool, even one that names the CRM. Filters: status text, customer, stale_only (the same open-quote rules the dashboard uses), created-date range." + PAGING_NOTE,
         QuoteArgs,
         get_quotes,
     ),
@@ -3139,7 +3472,7 @@ CHAT_TOOLS = [
     ),
     ChatTool(
         "search_customer360",
-        "Search the Zoho CRM (Customer 360 - a separate system from the Print247 ERP) for leads, contacts and customers by name, email, phone or company. Use it when a question is about a CRM record or its communication history, or when the ERP tools find nobody. Also call it WITHOUT asking the user first whenever the ERP finds the person but has no email or phone for them - missing contact details are exactly what this source is for; search here, then answer. Live results (capped at 10 per type by that API) are merged with the locally harvested record index, duplicates removed; each match carries the record_id and record_type that get_customer360 needs.",
+        "Search the Zoho CRM (Customer 360 - a separate system from the Print247 ERP) for leads, contacts and customers by name, email, phone or company. Use it when a question is about a CRM record or its communication history, or when the ERP tools find nobody. Never use it to answer a payments, invoices or quotes question, even one that says 'CRM payments' - those come from get_payments / get_invoices / get_quotes; search here for identity, contact details and history only. When the search returns two exact matches for the same name (the Lead and the Contact), they are two records of the one person: never ask the user which one - answer about both, and when an analysis was asked for, run it for both with get_customer360_analyses. Also call it WITHOUT asking the user first whenever the ERP finds the person but has no email or phone for them - missing contact details are exactly what this source is for; search here, then answer. Live results (capped at 10 per type by that API) are merged with the locally harvested record index, duplicates removed; each match carries the record_id and record_type that get_customer360 needs.",
         Customer360SearchArgs,
         search_customer360,
     ),
@@ -3151,25 +3484,37 @@ CHAT_TOOLS = [
     ),
     ChatTool(
         "get_customer360_analysis",
-        "Run the Zoho CRM's own AI follow-up analysis for ONE CRM record (record_id + record_type from search_customer360) and show it: urgency, reasoning, the action needed and a drafted email. Call this ONLY when the user names a record and explicitly asks for its analysis ('analyze him', 'is ki analysis karo') - it is slow (up to a minute cold), calls OpenAI on the CRM side every time, and is never a background or speculative call. Its words are the CRM AI's, not verified facts: present them labeled as the CRM AI analysis, and if ai_status is not 'Verified' say plainly that the CRM returned a placeholder analysis.",
+        "Run the Zoho CRM's own AI follow-up analysis for ONE CRM record (record_id + record_type from search_customer360) and show it: urgency, reasoning, the action needed and a drafted email. Call this ONLY when the user names a record and explicitly asks for its analysis ('analyze him', 'is ki analysis karo') - it is slow (up to a minute cold), calls OpenAI on the CRM side every time, and is never a background or speculative call. When search_customer360 found two exact matches for this person (the Lead and the Contact), do not ask which record to analyze and do not call this for one of them: use get_customer360_analyses for both records in one call. Its words are the CRM AI's, not verified facts: present them labeled as the CRM AI analysis, and if ai_status is not 'Verified' say plainly that the CRM returned a placeholder analysis.",
         Customer360DetailArgs,
         get_customer360_analysis,
     ),
     ChatTool(
         "get_customer360_analyses",
-        "Run the Zoho CRM's own AI analyses for TWO records in parallel in Python (records: [{record_id, record_type}, ...] from search_customer360) and show each under its own label. Use this - not two sequential get_customer360_analysis calls - whenever the user asks for both records' analyses: sequential slow CRM calls exceed one chat turn, parallel calls do not, and one record's failure does not take the other's analysis down. Same explicit-ask-only and Verified/placeholder rules as get_customer360_analysis.",
+        "Run the Zoho CRM's own AI analyses for TWO records in parallel in Python (records: [{record_id, record_type}, ...] from search_customer360) and show each under its own label. Use this - not two sequential get_customer360_analysis calls - whenever the user asks for both records' analyses, or asks for a person's analysis when the search returned two exact matches (the Lead and the Contact): never ask the user which record to analyze - analyze both. Sequential slow CRM calls exceed one chat turn, parallel calls do not, and one record's failure does not take the other's analysis down. Same explicit-ask-only and Verified/placeholder rules as get_customer360_analysis.",
         AnalysesArgs,
         get_customer360_analyses,
     ),
     ChatTool(
         "get_crm_follow_up_queue",
-        "List the customers currently waiting for a reply - the CRM Engagement queue from the latest agent run - with the channel each customer is waiting on (WhatsApp first), how many days they have waited, and the customer's own last message. Use for 'who is waiting', 'WhatsApp follow-ups', 'follow-up queue' questions. Costs no CRM call; the result's as_of is when the queue was computed - date the answer with it.",
+        "List the customers currently WAITING FOR A REPLY - the CRM Engagement queue from the latest FINISHED agent run - with the channel each customer is waiting on (WhatsApp counted first), how many days they have waited, and the customer's own last message. This is a waiting queue, NOT a message inbox: it cannot fetch, list or show anyone's WhatsApp/SMS/email messages, and it must never be used for a 'show/fetch all messages' or 'latest messages for all contacts' question - message lists across all contacts come from get_whatsapp_latest_messages (latest message per person) or get_whatsapp_top_contacts (counts ranked); one person's full thread comes from get_customer360's conversation. Use ONLY for 'who is waiting', 'unanswered follow-ups', 'follow-up queue' questions. Costs no CRM call; the result's as_of is when the queue was computed - date the answer with it. When it returns available=false with reason no_finished_run there is NO queue to report: say plainly that no finished agent run exists yet and the queue needs one - start it from the Run agents button or wait for the 6 AM daily run - and state no waiting count; a zero waiting_total only means zero when available is true.",
         EmptyArgs,
         get_crm_follow_up_queue,
     ),
     ChatTool(
+        "get_whatsapp_latest_messages",
+        "THE WhatsApp inbox over all people (Leads, Contacts and Customers - the CRM has no 'patients' record type): one paged list, newest message first, of each person's LATEST WhatsApp message - name, record type, company, message text, time and direction (Inbound/Outbound). Use this for 'fetch/show all (the) latest WhatsApp messages' questions - never the follow-up queue, which is about waiting, not messages. It lists ONLY people with at least one indexed WhatsApp message; a 'never messaged' or zero-message question is NOT answerable from this index while the coverage is partial. Real filters it accepts: direction ('Inbound' or 'Outbound') and a latest-message date range (date_from/date_to) - offer exactly these and nothing else. 'CSV' means CSV TEXT printed in the answer, never a file or download. It reads the local WhatsApp index (Mongo only, never a live CRM call) and the result's coverage block says exactly how far the index reaches ('Indexed N of M person records, as of T') - quote that coverage in the answer, and never present index data as live CRM data or a partial index as complete. Sets that fit one page come back whole; larger sets page, and a continuation keeps THIS page's limit and filters with offset=next_offset - never re-choose the page size. A live CRM sweep for never-messaged is infeasible (~30,000 calls) and must never be offered; allowed options are: (a) page the have-messages set, (b) CSV text export to compare offline, (c) full re-index via the runner." + PAGING_NOTE,
+        WhatsAppLatestArgs,
+        get_whatsapp_latest_messages,
+    ),
+    ChatTool(
+        "get_whatsapp_top_contacts",
+        "People (Leads, Contacts, Customers) RANKED by WhatsApp message count, most first: name, record type, company, whatsapp_count and latest_at per row. THE tool for 'who has more / the most WhatsApp messages', 'top WhatsApp customers', 'rank contacts by message count' - never the follow-up queue, which holds no counts. It covers ONLY people with at least ONE WhatsApp message: it can never answer 'who has NEVER had a WhatsApp message' or zero-message questions while the index is partial - do not call it to fill space on such a question, answer honestly with the limit + coverage instead. Reads the local WhatsApp index (Mongo only, never a live CRM call); quote the result's coverage block (indexed N of M, as of T) and never present it as live CRM data. A live CRM sweep for never-messaged is infeasible (~30,000 calls) and must never be offered; allowed options are: (a) page the have-messages set, (b) CSV text export to compare offline, (c) full re-index via the runner." + PAGING_NOTE,
+        RowsArgs,
+        get_whatsapp_top_contacts,
+    ),
+    ChatTool(
         "get_crm_morning_briefing",
-        "The CRM morning briefing for yesterday (business date): payments that landed in the Zoho CRM with their total, who is waiting for a reply (WhatsApp counted separately), and the biggest stalled deals. Use for 'morning briefing', 'aaj ki briefing', 'kal kya hua' questions. All figures are computed by the backend; the waiting/deals blocks carry as_of_run, the time of the agent run they came from.",
+        "The CRM morning briefing: CRM payments for that explicit calendar date (with total), who is waiting for a reply (WhatsApp counted separately), and the biggest stalled deals. State the explicit calendar date for the payments block (e.g. 'CRM payments for 2026-11-01'), never relying on an unanchored relative word whose reference frame is ambiguous. If using relative words, anchor to the run date ('yesterday relative to the run date'). Use for 'morning briefing', 'aaj ki briefing', 'kal kya hua' questions. All figures are computed by the backend; the waiting/deals blocks come from the latest FINISHED agent run and carry a status - present, empty, or unavailable. Present a partial briefing honestly: name the block that is unavailable and why (no finished run yet - start one from the Run agents button or wait for the 6 AM daily run) and state figures only for blocks that are present; run_status no_finished_run means the waiting and deals counts are not real zeros - never report them as zero. The waiting/deals blocks carry as_of_run, the time of the agent run they came from.",
         EmptyArgs,
         get_crm_morning_briefing,
     ),

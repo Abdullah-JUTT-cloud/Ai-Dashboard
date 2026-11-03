@@ -758,7 +758,7 @@ async def _crm_engagement_items(database: Any, now: datetime) -> list[dict]:
                 "company": entity.get("company"),
                 "waiting_days": int(waiting),
                 "channel": last.get("type"),
-                "last_customer_message": (last_message or "")[:200] or None,
+                "last_customer_message": processors.readable_text(last_message, 200) or None,
             }
             payload_out = crm_engagement_payload(summary, "Lead", int(waiting))
             items.append(

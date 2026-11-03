@@ -79,6 +79,12 @@ INDEXES: dict[str, tuple[tuple[str, tuple[tuple[str, int], ...]], ...]] = {
     #     UNIQUE; here we only add the newest-first read index the task list
     #     uses. ---
     "task_events": (("by_ts", (("ts", DESC),)),),
+    # --- WhatsApp index (customer360_whatsapp): the two chat tools read the
+    #     newest-message list and the count ranking straight off these orders. ---
+    "customer360_whatsapp": (
+        ("latest_desc", (("latest_at", DESC), ("_id", A))),
+        ("count_desc", (("whatsapp_count", DESC), ("latest_at", DESC))),
+    ),
 }
 
 

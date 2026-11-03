@@ -586,6 +586,25 @@ export function ExecutionControllerProvider({ children }: { children: ReactNode 
     }
   }, [events.taskStatus, endRecovery, failTurn]);
 
+  // Settle the turn from the durable task event stream when the task completes
+  // or fails, ensuring the view never hangs if the chat stream stalls.
+  useEffect(() => {
+    const current = turnRef.current;
+    if (!current) return;
+    if (
+      current.phase === "completed" ||
+      current.phase === "failed" ||
+      current.phase === "cancelled"
+    ) {
+      return;
+    }
+    if (events.taskStatus === "completed") {
+      finishTurn(current.turnId);
+    } else if (events.taskStatus === "failed" || events.taskStatus === "cancelled") {
+      failTurn(current.turnId, "That request did not complete.");
+    }
+  }, [events.taskStatus, failTurn, finishTurn]);
+
   // A pending recovery poll must not outlive the provider.
   useEffect(() => stopRecoveryTimer, [stopRecoveryTimer]);
 
@@ -731,7 +750,7 @@ export function ExecutionControllerProvider({ children }: { children: ReactNode 
             failTurn(turnId, reason);
           }
         } finally {
-          if (turnRef.current?.turnId === turnId) {
+          if (turnRef.current?.turnId === turnId || turnRef.current === null) {
             sendingRef.current = false;
             setIsSending(false);
             setActiveTool("");
