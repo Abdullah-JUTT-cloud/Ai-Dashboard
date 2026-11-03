@@ -32,7 +32,7 @@ from app.agents.llm import add_usage, build_model, empty_usage, usage_of
 from app.config import settings
 from app.services import periods
 from app.services.events import get_event_service
-from app.services.processors import ERP_TZ
+from app.services.processors import ERP_TZ, to_number
 from app.services.crm_digest import format_human_timestamp
 
 log = logging.getLogger("chat_agent")
@@ -2145,6 +2145,255 @@ def query_context(tool: str, args: Any, page: dict, question: str = "") -> dict:
     }
 
 
+def _first_sentence(text: str) -> str:
+    cleaned = re.sub(r"[#*`_>~]", "", text or "").strip()
+    cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
+    cleaned = re.sub(r"```[a-zA-Z]*\n[\s\S]*?```", "", cleaned)
+    cleaned = " ".join(cleaned.split())
+    if not cleaned:
+        return ""
+    match = re.search(r"^(.*?[.!?\u06D4])(?:\s|$)", cleaned)
+    if match:
+        first = match.group(1).strip()
+    else:
+        first = cleaned
+    if len(first) > 280:
+        return cleaned[:280]
+    return first
+
+
+def _format_named_items(items: list[tuple[str, Any]]) -> str:
+    if not items:
+        return ""
+    if len(items) == 1:
+        name, amt = items[0]
+        if amt is not None:
+            return f"Largest is {name} at {format_money(amt)}."
+        return f"Top is {name}."
+    elif len(items) == 2:
+        (n1, a1), (n2, a2) = items[0], items[1]
+        if a1 is not None and a2 is not None:
+            return f"Largest is {n1} at {format_money(a1)} and {n2} at {format_money(a2)}."
+        return f"Top are {n1} and {n2}."
+    else:
+        (n1, a1), (n2, a2), (n3, a3) = items[0], items[1], items[2]
+        if a1 is not None and a2 is not None and a3 is not None:
+            return f"Largest is {n1} at {format_money(a1)} then {n2} at {format_money(a2)} and {n3} at {format_money(a3)}."
+        return f"Top are {n1}, {n2}, and {n3}."
+
+
+def build_voice_summary(
+    final_text: str,
+    tool_results: list[dict],
+    question: str = "",
+) -> str:
+    """Build a cheap, deterministic voice summary <= 280 chars and <= 2 sentences.
+
+    Rules:
+    - ALWAYS computed (cheap, deterministic); the client speaks it only for voice-origin turns.
+    - Built from the turn's tool evidence, NEVER a fresh LLM call: if the answer has numeric evidence,
+      the summary is a template sentence from that evidence: total + count + top 1-3 named items max.
+      If there is no numeric evidence, the summary is the FIRST SENTENCE of the final answer.
+    - HARD CAP: <= 280 characters, <= 2 sentences. If the evidence template exceeds the cap, drop to
+      fewer items (top 1 instead of top 3) — never truncate mid-sentence or mid-number.
+    - NEVER a row list, NEVER more than 3 named items, NEVER a number that is not in the turn's tool evidence.
+      The summary MUST pass validate_numeric_claims against the turn's evidence; if it trips the guard,
+      replace it with the first sentence of the answer (or first 280 chars if no sentence boundary).
+    - Same language as the answer; do not translate.
+    """
+    sentence_1 = ""
+    candidate_items: list[tuple[str, Any]] = []
+
+    # Priority check for specific tool outcomes
+    for entry in tool_results:
+        if not isinstance(entry, dict):
+            continue
+        tool_name = str(entry.get("tool") or "")
+        res = entry.get("result")
+        if not isinstance(res, dict):
+            continue
+
+        if tool_name == "get_invoices":
+            total = res.get("sum_balance") if res.get("sum_balance") is not None else res.get("total_amount")
+            count = res.get("total_count")
+            if count is None:
+                count = len(res.get("items") or [])
+            filters = res.get("filters_applied") or {}
+            is_overdue = bool(filters.get("overdue_only") or "overdue" in question.lower() or "overdue" in (final_text or "").lower())
+            prefix = "Overdue balance is" if is_overdue else "Unpaid balance is"
+            noun = "invoices" if count != 1 else "invoice"
+            if total is not None and count is not None:
+                sentence_1 = f"{prefix} {format_money(total)} across {count} {noun}."
+            raw_items = res.get("items") or []
+            sorted_items = sorted(
+                raw_items,
+                key=lambda x: to_number(x.get("balance", x.get("total_amount", 0))),
+                reverse=True,
+            )
+            for it in sorted_items:
+                name = it.get("customer_name") or it.get("customer") or it.get("company")
+                if name:
+                    amt = it.get("balance") if it.get("balance") is not None else it.get("total_amount")
+                    candidate_items.append((str(name).strip(), amt))
+            break
+
+        if tool_name == "get_quotes":
+            total = res.get("sum_amount") if res.get("sum_amount") is not None else res.get("total_amount")
+            count = res.get("total_count")
+            if count is None:
+                count = len(res.get("items") or [])
+            filters = res.get("filters_applied") or {}
+            is_stale = bool(filters.get("stale_only") or "stale" in question.lower() or "stale" in (final_text or "").lower())
+            noun = "stale quotes" if is_stale else "quotes"
+            if count == 1:
+                noun = "stale quote" if is_stale else "quote"
+            if total is not None and count is not None:
+                sentence_1 = f"{count} {noun} worth {format_money(total)}."
+            raw_items = res.get("items") or []
+            sorted_items = sorted(
+                raw_items,
+                key=lambda x: to_number(x.get("amount", 0)),
+                reverse=True,
+            )
+            for it in sorted_items:
+                name = it.get("customer_name") or it.get("customer") or it.get("company")
+                if name:
+                    amt = it.get("amount")
+                    candidate_items.append((str(name).strip(), amt))
+            break
+
+        if tool_name == "get_crm_follow_up_queue":
+            waiting = res.get("waiting_total", 0)
+            if res.get("available") is False:
+                sentence_1 = "No finished agent run yet for the follow-up queue."
+            elif waiting == 1:
+                sentence_1 = "1 customer waiting in the follow-up queue."
+            else:
+                sentence_1 = f"{waiting} customers waiting in the follow-up queue."
+            break
+
+        if tool_name == "get_payments":
+            total = res.get("sum_amount") if res.get("sum_amount") is not None else res.get("total_amount")
+            count = res.get("total_count")
+            if count is None:
+                count = len(res.get("items") or [])
+            noun = "payments" if count != 1 else "payment"
+            if total is not None and count is not None:
+                sentence_1 = f"Total payments are {format_money(total)} across {count} {noun}."
+            raw_items = res.get("items") or []
+            sorted_items = sorted(
+                raw_items,
+                key=lambda x: to_number(x.get("amount", 0)),
+                reverse=True,
+            )
+            for it in sorted_items:
+                name = it.get("customer_name") or it.get("customer") or it.get("company")
+                if name:
+                    candidate_items.append((str(name).strip(), it.get("amount")))
+            break
+
+        if tool_name == "get_revenue":
+            rev = res.get("total_revenue")
+            count = res.get("payment_count") or res.get("count")
+            if rev is not None:
+                if count is not None:
+                    noun = "payments" if count != 1 else "payment"
+                    sentence_1 = f"Total revenue is {format_money(rev)} across {count} {noun}."
+                else:
+                    sentence_1 = f"Total revenue is {format_money(rev)}."
+            break
+
+        if tool_name == "get_orders":
+            total = res.get("sum_amount") or res.get("sum_balance")
+            count = res.get("total_count") or len(res.get("items") or [])
+            noun = "orders" if count != 1 else "order"
+            if total is not None:
+                sentence_1 = f"Stalled orders total {format_money(total)} across {count} {noun}."
+            raw_items = res.get("items") or []
+            for it in raw_items:
+                name = it.get("customer_name") or it.get("customer")
+                if name:
+                    amt = it.get("amount") or it.get("balance")
+                    candidate_items.append((str(name).strip(), amt))
+            break
+
+        if tool_name in ("get_stuck_leads", "get_leads"):
+            count = res.get("total_count") or len(res.get("items") or [])
+            is_stuck = "stuck" in tool_name.lower()
+            noun = "stuck leads" if is_stuck else "leads"
+            if count == 1:
+                noun = "stuck lead" if is_stuck else "lead"
+            sentence_1 = f"{count} {noun} found."
+            raw_items = res.get("items") or []
+            for it in raw_items:
+                name = it.get("name") or it.get("company") or it.get("contact_name")
+                if name:
+                    candidate_items.append((str(name).strip(), None))
+            break
+
+    # General numeric fallback from tool_evidence if no specific tool matched
+    if not sentence_1:
+        for entry in tool_results:
+            if not isinstance(entry, dict):
+                continue
+            ev = tool_evidence(str(entry.get("tool")), entry.get("result"))
+            if not ev:
+                continue
+            if "money_total" in ev and "records_total" in ev:
+                sentence_1 = f"Total is {format_money(ev['money_total'])} across {ev['records_total']} records."
+                break
+            elif "records_total" in ev:
+                sentence_1 = f"{ev['records_total']} records found."
+                break
+            elif "money_total" in ev:
+                sentence_1 = f"Total is {format_money(ev['money_total'])}."
+                break
+
+    # If answer has numeric evidence
+    if sentence_1:
+        # Preserve Urdu script if original answer was Urdu script
+        if final_text and re.search(r"[\u0600-\u06FF]", final_text):
+            first = _first_sentence(final_text)
+            if len(first) <= 280 and not validate_numeric_claims(first, tool_results, "", question):
+                return first
+
+        # Deduplicate candidate items by name
+        seen_names = set()
+        unique_items: list[tuple[str, Any]] = []
+        for name, amt in candidate_items:
+            if name not in seen_names:
+                seen_names.add(name)
+                unique_items.append((name, amt))
+
+        summary = sentence_1
+        if unique_items:
+            max_k = min(3, len(unique_items))
+            for k in range(max_k, 0, -1):
+                sent_2 = _format_named_items(unique_items[:k])
+                cand = f"{sentence_1} {sent_2}".strip()
+                if len(cand) <= 280 and not validate_numeric_claims(cand, tool_results, "", question):
+                    summary = cand
+                    break
+
+        if len(summary) > 280 or validate_numeric_claims(summary, tool_results, "", question):
+            if len(sentence_1) <= 280 and not validate_numeric_claims(sentence_1, tool_results, "", question):
+                summary = sentence_1
+            else:
+                # Numeric guard failure on template path: fall back to answer's own words
+                fallback = _first_sentence(final_text)
+                if not fallback or not fallback.strip():
+                    fallback = (final_text or "").strip()[:280]
+                summary = fallback
+        if summary and summary.strip():
+            return summary
+
+    # No numeric evidence: (2) first sentence of answer, (3) first 280 chars of answer
+    summary = _first_sentence(final_text)
+    if not summary or not summary.strip():
+        summary = (final_text or "").strip()[:280]
+    return summary
+
+
 def _context_age_hours(last_query: dict) -> float | None:
     """Hours since the recorded query, or None when the record has no stamp.
 
@@ -3233,14 +3482,18 @@ async def execute_chat(
         "task_id": task_id,
     }
     result = await graph.ainvoke(initial)
+    final_text = result.get("final_text", "")
+    tool_results = result.get("tool_results", [])
+    voice_sum = build_voice_summary(final_text, tool_results, question=message)
     return {
-        "text": result.get("final_text", ""),
+        "text": final_text,
         "tools_used": result.get("tools_used", []),
-        "tool_results": result.get("tool_results", []),
+        "tool_results": tool_results,
         "tokens": result.get("usage") or empty_usage(),
         "emitted_tokens": int(result.get("emitted_tokens") or 0),
         "query_context": result.get("query_context") or None,
         "validation_replaced": bool(result.get("validation_replaced")),
+        "voice_summary": voice_sum,
     }
 
 
@@ -3280,6 +3533,9 @@ async def get_chat_thread(thread_id: str, database: Any = None) -> dict | None:
             "question": str(turn.get("question") or ""),
             "answer": str(turn.get("answer") or ""),
             "created_at": turn.get("created_at"),
+            **({"task_id": turn["task_id"]} if turn.get("task_id") else {}),
+            **({"voice_summary": turn["voice_summary"]} if turn.get("voice_summary") else {}),
+            **({"csv_export": turn["csv_export"]} if turn.get("csv_export") else {}),
         }
         for turn in doc.get("turns") or []
     ]
@@ -3398,9 +3654,10 @@ async def run_chat(
                 f"All {total} {noun} were already returned on the first page; "
                 "there are no more records to fetch."
             )
+            voice_sum = build_voice_summary(answer_text, [], question=message)
             updated_turns = trim_turns([
                 *turns,
-                {"question": message, "answer": answer_text, "created_at": started, "task_id": task_id},
+                {"question": message, "answer": answer_text, "created_at": started, "task_id": task_id, "voice_summary": voice_sum},
             ])
             await db.chat_threads.update_one(
                 {"thread_id": thread_id},
@@ -3430,6 +3687,7 @@ async def run_chat(
                 "query_context": last_query,
                 "validation_replaced": False,
                 "task_id": task_id,
+                "voice_summary": voice_sum,
             }
         # Sticky pagination (live Nov 2): the recorded listing came back
         # whole, so no pending action exists - but "the next page" still
@@ -3674,7 +3932,13 @@ async def run_chat(
         )
         if continuation_broken:
             new_pending = None
-        turn_entry = {"question": message, "answer": outcome["text"], "created_at": started, "task_id": task_id}
+        turn_entry = {
+            "question": message,
+            "answer": outcome["text"],
+            "created_at": started,
+            "task_id": task_id,
+            "voice_summary": outcome.get("voice_summary"),
+        }
         if forced.get("csv_export"):
             turn_entry["csv_export"] = forced["csv_export"]
             outcome["csv_export"] = forced["csv_export"]

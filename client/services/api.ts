@@ -407,6 +407,8 @@ export interface ChatThreadSummary {
 export interface ChatThreadTurn {
   question: string;
   answer: string;
+  task_id?: string | null;
+  voice_summary?: string;
   created_at?: string | null;
 }
 

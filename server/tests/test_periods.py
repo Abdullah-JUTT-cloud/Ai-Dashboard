@@ -191,3 +191,26 @@ def test_this_week_is_never_read_as_a_nested_this_week_to_date():
     once and must not also fire the shorter name."""
     assert detect_period_name("revenue for this week to date") == "this_week_to_date"
     assert detect_period_name("revenue for this week") == "this_week"
+
+
+def test_both_today_payment_phrasings_produce_identical_date_filter():
+    """Diagnostic regression: Turn 1 ('how many payments came today and how much price')
+    and Turn 3 ('give me all payment data of today') must both recognize 'today' and
+    produce the exact same date_from/date_to filter for PaymentArgs on any business date."""
+    q1 = "how many payments came today and how much price"
+    q2 = "give me all payment data of today"
+
+    p1 = detect_period_name(q1)
+    p2 = detect_period_name(q2)
+    assert p1 == "today"
+    assert p2 == "today"
+
+    for sample_date in [date(2026, 11, 3), date(2026, 11, 4)]:
+        from app.agents.chat import _named_period_args
+
+        f1 = _named_period_args(p1, sample_date, PaymentArgs, {})
+        f2 = _named_period_args(p2, sample_date, PaymentArgs, {})
+        assert f1 == f2
+        assert f1["date_from"] == sample_date.isoformat()
+        assert f1["date_to"] == sample_date.isoformat()
+

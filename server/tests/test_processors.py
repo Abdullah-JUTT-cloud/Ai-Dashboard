@@ -271,6 +271,64 @@ async def test_tile_set_equals_chat_overdue_set_on_fixtures():
     assert totals["overdue_total"] == chat_overdue_sum == 3280.0
 
 
+def test_unpaid_invoices_partially_paid_positive_balance_included():
+    """Option A: Partially paid invoice (payment_status=1, balance > 0) is included."""
+    inv = order(
+        id=30500,
+        payment_status=1,
+        payment_status_label="Partially Paid",
+        total_amount=1000.0,
+        amount_paid=400.0,
+        invoice_date=(NOW - timedelta(days=40)).isoformat(),
+    )
+    rows = processors.unpaid_invoices([inv], NOW)
+    assert len(rows) == 1
+    assert rows[0]["id"] == 30500
+    assert rows[0]["balance"] == 600.0
+    assert rows[0]["overdue"] is True
+
+
+def test_unpaid_invoices_overpaid_negative_balance_excluded():
+    """Option A: Overpaid invoice (balance <= 0) is excluded."""
+    inv = order(
+        id=30501,
+        payment_status=2,
+        payment_status_label="Paid",
+        total_amount=500.0,
+        amount_paid=600.0,
+        invoice_date=(NOW - timedelta(days=40)).isoformat(),
+    )
+    rows = processors.unpaid_invoices([inv], NOW)
+    assert len(rows) == 0
+
+
+def test_unpaid_invoices_sorted_by_balance_descending_then_age():
+    """Option A: Invoices are sorted by biggest debt first, then oldest age."""
+    inv1 = order(id=1, total_amount=500.0, amount_paid=0.0, invoice_date=(NOW - timedelta(days=40)).isoformat())
+    inv2 = order(id=2, total_amount=1500.0, amount_paid=0.0, invoice_date=(NOW - timedelta(days=20)).isoformat())
+    inv3 = order(id=3, total_amount=500.0, amount_paid=0.0, invoice_date=(NOW - timedelta(days=60)).isoformat())
+    rows = processors.unpaid_invoices([inv1, inv2, inv3], NOW)
+    assert [r["id"] for r in rows] == [2, 3, 1]
+
+
+def test_unpaid_invoices_due_date_and_customer_preserved():
+    """Option A: due_date, customer, and sale_rep references are preserved."""
+    inv = order(
+        id=30502,
+        total_amount=800.0,
+        amount_paid=0.0,
+        invoice_date=(NOW - timedelta(days=15)).isoformat(),
+        due_date=(NOW + timedelta(days=15)).isoformat(),
+        customer={"id": 99, "company_name": "Test Co"},
+        sale_rep={"id": 88, "name": "Alice"},
+    )
+    rows = processors.unpaid_invoices([inv], NOW)
+    assert len(rows) == 1
+    assert rows[0]["customer"]["company_name"] == "Test Co"
+    assert rows[0]["sale_rep"]["name"] == "Alice"
+    assert rows[0]["due_date"] is not None
+
+
 # ------------------------------------------------------------ stalled_orders
 
 

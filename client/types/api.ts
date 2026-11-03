@@ -361,6 +361,7 @@ export interface ChatDoneEvent {
   // the task id this turn's events are recorded under (announced by the first
   // `task` event); absent on a backend that predates task correlation
   task_id?: string;
+  voice_summary?: string;
 }
 
 export interface ChatErrorEvent {

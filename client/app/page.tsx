@@ -14,6 +14,9 @@ import {
 } from "@/components/command-center/execution-context";
 import { ExecutionOverlay } from "@/components/command-center/execution-overlay";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { VoiceProvider, useVoice } from "@/lib/voice-context";
+import { FloatingVoiceMic } from "@/components/floating-voice-mic";
+import { VoiceConsole } from "@/components/voice-console";
 
 function HomeView() {
   const [isCustomerSheetOpen, setIsCustomerSheetOpen] = useState(false);
@@ -23,6 +26,7 @@ function HomeView() {
   const [activeTab, setActiveTab] = useState("command-center");
 
   const { status, error: liveError, lastEventAt, refresh } = useLiveData();
+  const { isFullScreen, closeFullScreen } = useVoice();
 
   // The Command Center has its own primary conversation. Showing the global AI
   // sidebar at the same time would duplicate that single conversation.
@@ -111,6 +115,14 @@ function HomeView() {
         </button>
       )}
 
+      {/* Floating site-wide mic button: visible on all tabs, hidden while full-screen is open */}
+      <FloatingVoiceMic />
+
+      {/* Full-screen voice console: covers the app with animation, shows same simple chat at full width */}
+      {isFullScreen && (
+        <VoiceConsole mode="fullscreen" onClose={closeFullScreen} />
+      )}
+
       {/* One overlay for every chat entry point */}
       <ExecutionOverlay />
     </div>
@@ -122,9 +134,12 @@ export default function Home() {
     <SystemHealthProvider>
       <LiveDataProvider>
         <ExecutionControllerProvider>
-          <HomeView />
+          <VoiceProvider>
+            <HomeView />
+          </VoiceProvider>
         </ExecutionControllerProvider>
       </LiveDataProvider>
     </SystemHealthProvider>
   );
 }
+
