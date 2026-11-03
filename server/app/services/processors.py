@@ -380,14 +380,62 @@ def stale_quotes(
             "created_at": iso_or_none(quote.get("created_at")),
             "customer": customer_ref(quote),
             "sale_rep": sale_rep_ref(quote),
+            "_exact_age": age,
         }
         customer_key = quote.get("customer").get("id") if isinstance(quote.get("customer"), dict) else None
         current = kept_by_customer.get(customer_key)
-        # keep the newest quote per customer (age_days: smaller = newer)
-        if current is None or row["age_days"] < current["age_days"]:
+        # keep the newest quote per customer (smaller age = newer, break ties on higher id)
+        if (
+            current is None
+            or age < current["_exact_age"]
+            or (age == current["_exact_age"] and int(quote.get("id") or 0) > int(current.get("id") or 0))
+        ):
             kept_by_customer[customer_key] = row
 
-    result = list(kept_by_customer.values())
+    result = []
+    for row in kept_by_customer.values():
+        row.pop("_exact_age", None)
+        result.append(row)
+    result.sort(key=lambda row: row["amount"], reverse=True)
+    return result
+
+
+def open_quotes(
+    quotes: Iterable[Mapping[str, Any]],
+    now: Optional[datetime] = None,
+    *,
+    order_quote_ids: Optional[Iterable[int]] = None,
+    closed_statuses: Optional[frozenset] = None,
+) -> list[dict]:
+    """All open, unconverted quote records (status not in CLOSED_QUOTE_STATUSES)."""
+    now = now or datetime.now(timezone.utc)
+    closed = (
+        frozenset(CLOSED_QUOTE_STATUSES)
+        if closed_statuses is None
+        else frozenset(closed_statuses)
+    )
+    converted_ids = set(order_quote_ids or ())
+    result: list[dict] = []
+    for quote in quotes:
+        status = contact_to_s(quote.get("status"))
+        if status in closed:
+            continue
+        if quote.get("id") in converted_ids:
+            continue
+        dt = parse_date(quote.get("created_at"))
+        age = age_days(dt, now)
+        result.append({
+            "id": quote.get("id"),
+            "ref": quote.get("ref") or quote.get("inv_ref"),
+            "status": status,
+            "status_order": quote.get("status_order"),
+            "amount": round(to_number(quote.get("amount")), 2),
+            "age_days": round(age, 2) if age is not None else None,
+            "days_stale": int(age) if age is not None else None,
+            "created_at": iso_or_none(quote.get("created_at")),
+            "customer": customer_ref(quote),
+            "sale_rep": sale_rep_ref(quote),
+        })
     result.sort(key=lambda row: row["amount"], reverse=True)
     return result
 
@@ -400,9 +448,9 @@ def unpaid_invoices(
 ) -> list[dict]:
     """Orders worth chasing for money, tightened in v2:
 
-      * payment_status 0 (Not Paid), 1 (Partially Paid), or null WITH a
-        non-zero total (null on a zero-total invoice is nothing to chase);
       * balance must be strictly greater than 0;
+      * payment_status == PAID flag alone does not exclude a row with balance > 0;
+      * null on a zero-total invoice is nothing to chase (draft/empty invoice);
       * sorted by balance descending (biggest debt first).
     """
     now = now or datetime.now(timezone.utc)
@@ -410,8 +458,6 @@ def unpaid_invoices(
     result = []
     for order in orders:
         payment_status = order.get("payment_status")
-        if payment_status == PAYMENT_STATUS_PAID:
-            continue
         total = to_number(order.get("total_amount"))
         if payment_status is None and total == 0:
             continue  # nothing to collect on an empty invoice
@@ -864,6 +910,162 @@ def stuck_leads(
     # repeat or skip rows between pages).
     result.sort(key=lambda row: (row["age_days"], row["lead_id"]))
     return result
+
+
+LOST_LEAD_STATUSES = frozenset(
+    {
+        "Lost Lead",
+        "Junk Lead",
+        "Not Qualified",
+        "Dont Contact",
+        "Denied Contact",
+        "Not Interested",
+        "Invalid Phone",
+        "Invalid Email",
+        "Not Responded",
+    }
+)
+
+WORKING_LEAD_STATUSES = frozenset(
+    {
+        "Contacted",
+        "Contact in Future",
+        "Contact Again",
+        "Pre-Qualified",
+    }
+)
+
+LEAD_CATEGORIES = (
+    "New",
+    "Stuck",
+    "Working",
+    "Dormant",
+    "Converted",
+    "Lost",
+    "Other",
+)
+
+
+def partition_leads(
+    leads: Iterable[Mapping[str, Any]],
+    now: Optional[datetime] = None,
+    *,
+    days: Optional[int] = None,
+) -> tuple[dict[str, int], list[dict]]:
+    """Partition all leads into exactly one category: New, Stuck, Working, Dormant, Converted, Lost, Other.
+
+    Pure Python. Reuses processors.stuck_leads for Stuck leads so the Stuck
+    category output is identical to GET /api/leads/stuck.
+    """
+    now = now or datetime.now(timezone.utc)
+    window = settings.LEAD_ACTIVE_DAYS if days is None else days
+    rows = list(leads)
+
+    stuck_list = stuck_leads(rows, now, days=days)
+    stuck_by_id = {row["lead_id"]: row for row in stuck_list}
+
+    all_items: list[dict] = []
+    category_counts: dict[str, int] = {cat: 0 for cat in LEAD_CATEGORIES}
+
+    for lead in rows:
+        lead_id = contact_to_s(lead.get("zohoLeadId")) or str(lead.get("_id") or "")
+        desk = lead.get("leadDesk") if isinstance(lead.get("leadDesk"), Mapping) else {}
+        status = contact_to_s(lead.get("status"))
+        stage = contact_to_s(desk.get("stage"))
+        flag = contact_to_s(desk.get("flagReason"))
+        converted_at = desk.get("convertedAt")
+
+        # 1. Stuck = processors.stuck_leads output EXACTLY
+        if lead_id in stuck_by_id:
+            category = "Stuck"
+            item = dict(stuck_by_id[lead_id])
+            item["category"] = "Stuck"
+            item["desk_stage"] = stage or None
+            item["flag_reason"] = flag or None
+        else:
+            # 2. Converted: marked converted by CRM status or desk stage / convertedAt
+            if status == "Converted" or stage == "converted" or converted_at is not None:
+                category = "Converted"
+            # 3. Lost: disqualifying status or disqualifying flagReason
+            elif status in LOST_LEAD_STATUSES or bool(flag):
+                category = "Lost"
+            # 4. Working: actively engaged (status Contacted, desk stage in_progress if any)
+            elif status in WORKING_LEAD_STATUSES or stage == "in_progress":
+                category = "Working"
+            # 5. New / Dormant: top-of-funnel leads partitioned by age
+            elif status in STUCK_LEAD_STATUSES or status == "Not Contacted":
+                created = parse_date(lead.get("createdAt"))
+                activity = parse_date(lead.get("lastActivityAt")) or created
+                age_created = age_days(created, now) if created else None
+                age_activity = age_days(activity, now) if activity else None
+
+                if age_created is not None and 0 <= age_created <= window:
+                    category = "New"
+                elif (age_activity is not None and age_activity > window) or (age_created is not None and age_created > window):
+                    category = "Dormant"
+                else:
+                    category = "Dormant"
+            else:
+                category = "Other"
+
+            description = str(lead.get("description") or "").strip()
+            parsed = parse_lead_description(description) if description else {}
+            email = contact_to_s(lead.get("email"))
+            phone = contact_to_s(lead.get("phone"))
+            first = contact_to_s(lead.get("firstName"))
+            last = contact_to_s(lead.get("lastName"))
+            contact_name = " ".join(part for part in (first, last) if part) or None
+            activity = parse_date(lead.get("lastActivityAt")) or parse_date(lead.get("createdAt"))
+            age = age_days(activity, now)
+            age_days_val = round(age, 1) if age is not None else 999999.0
+            missing = missing_lead_fields(parsed) if description else []
+            if not email and not phone and status in STUCK_LEAD_STATUSES:
+                missing.append("contact_info")
+
+            item = {
+                "lead_id": lead_id,
+                "contact_name": contact_name,
+                "company": contact_to_s(lead.get("company")) or None,
+                "status": status,
+                "source": contact_to_s(lead.get("source")) or None,
+                "days_since_activity": int(age) if age is not None else 0,
+                "age_days": age_days_val,
+                "last_activity_at": iso_or_none(lead.get("lastActivityAt")),
+                "created_at": iso_or_none(lead.get("createdAt")),
+                "product": parsed.get("product"),
+                "type": parsed.get("type"),
+                "quantity": parsed.get("quantity"),
+                "size": parsed.get("size"),
+                "material": parsed.get("material"),
+                "finish": parsed.get("finish"),
+                "artwork_present": parsed.get("artwork_present"),
+                "description_shape": parsed.get("shape"),
+                "missing": missing,
+                "next_action": lead_next_action(
+                    missing,
+                    contact_name,
+                    artwork_present=parsed.get("artwork_present"),
+                    description_shape=parsed.get("shape"),
+                ),
+                "conversion_reason": conversion_reason(
+                    missing,
+                    status,
+                    int(age) if age is not None else None,
+                    artwork_present=parsed.get("artwork_present"),
+                    description_shape=parsed.get("shape"),
+                ),
+                "has_contact_details": bool(email or phone),
+                "description": description,
+                "category": category,
+                "desk_stage": stage or None,
+                "flag_reason": flag or None,
+            }
+
+        category_counts[category] += 1
+        all_items.append(item)
+
+    all_items.sort(key=lambda row: (row["age_days"], row["lead_id"]))
+    return category_counts, all_items
 
 
 # --------------------------------------------------------------------------

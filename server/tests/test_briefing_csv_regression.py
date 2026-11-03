@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import pytest
 from langchain_core.messages import AIMessage
 
@@ -728,6 +728,8 @@ async def test_csv_scope_entity_overrides_previous_listing():
     """Test (b): overdue list in prior turn -> 'give invoice 33245 in CSV' returns
     1 row (only invoice 33245, stated '1 row'), NOT the 270 overdue rows.
     """
+    now = datetime.now(timezone.utc)
+    inv_date = (now - timedelta(days=30)).replace(microsecond=0).isoformat()
     invoice_33245 = {
         "_id": 33245,
         "id": 33245,
@@ -737,7 +739,7 @@ async def test_csv_scope_entity_overrides_previous_listing():
         "amount_paid": 0.0,
         "payment_status_label": "No payment recorded",
         "status_label": "Approved",
-        "invoice_date": "2026-10-03T03:53:45-05:00",
+        "invoice_date": inv_date,
     }
     other_invoices = [
         {
@@ -779,7 +781,7 @@ async def test_csv_scope_entity_overrides_previous_listing():
             "[Download invoice-33245.csv](#download:invoice-33245.csv)\n\n"
             "```csv\n"
             "Invoice Number,Customer,Amount,Balance,Payment Status,Order Status,Invoice Date,Due Date,Days Overdue\n"
-            '33245-2026-10,Pure 7,"$70,425.00","$70,425.00",No payment recorded,Approved,2026-10-03T03:53:45-05:00,,0 days past 30-day terms (due today / first day overdue)\n'
+            f'33245-2026-10,Pure 7,"$70,425.00","$70,425.00",No payment recorded,Approved,{inv_date},,0 days past 30-day terms (due today / first day overdue)\n'
             "```"
         )
     ])
@@ -803,6 +805,8 @@ async def test_csv_scope_entity_overrides_previous_listing():
 @pytest.mark.asyncio
 async def test_csv_scope_fresh_entity_with_no_prior_listing():
     """Test (c): Fresh 'give invoice 33245 in CSV' with no prior listing -> 1 row."""
+    now = datetime.now(timezone.utc)
+    inv_date = (now - timedelta(days=30)).replace(microsecond=0).isoformat()
     invoice_33245 = {
         "_id": 33245,
         "id": 33245,
@@ -812,7 +816,7 @@ async def test_csv_scope_fresh_entity_with_no_prior_listing():
         "amount_paid": 0.0,
         "payment_status_label": "No payment recorded",
         "status_label": "Approved",
-        "invoice_date": "2026-10-03T03:53:45-05:00",
+        "invoice_date": inv_date,
     }
     db = business_db()
     db.orders_flat = Collection([invoice_33245])
@@ -825,7 +829,7 @@ async def test_csv_scope_fresh_entity_with_no_prior_listing():
             "[Download invoice-33245.csv](#download:invoice-33245.csv)\n\n"
             "```csv\n"
             "Invoice Number,Customer,Amount,Balance,Payment Status,Order Status,Invoice Date,Due Date,Days Overdue\n"
-            '33245-2026-10,Pure 7,"$70,425.00","$70,425.00",No payment recorded,Approved,2026-10-03T03:53:45-05:00,,0 days past 30-day terms (due today / first day overdue)\n'
+            f'33245-2026-10,Pure 7,"$70,425.00","$70,425.00",No payment recorded,Approved,{inv_date},,0 days past 30-day terms (due today / first day overdue)\n'
             "```"
         )
     ])
@@ -1001,6 +1005,8 @@ async def test_detail_view_overdue_label_and_human_dates():
     """get_record for invoice 33245-2026-10 populates overdue boundary label and invoice_date_human."""
     from app.agents.chat_tools import get_record
 
+    now = datetime.now(timezone.utc)
+    boundary_date = (now - timedelta(days=30)).replace(hour=3, minute=53, second=45).isoformat()
     raw_invoice = {
         "_id": 33245,
         "id": 33245,
@@ -1010,7 +1016,7 @@ async def test_detail_view_overdue_label_and_human_dates():
         "amount_paid": 0.0,
         "payment_status_label": "No payment recorded",
         "status_label": "Approved",
-        "invoice_date": "2026-10-03T03:53:45-05:00",
+        "invoice_date": boundary_date,
     }
     db = business_db()
     db.orders_flat = Collection([raw_invoice])
@@ -1020,7 +1026,11 @@ async def test_detail_view_overdue_label_and_human_dates():
     rec = res["record"]
     assert rec["days_overdue_label"] == "0 days past 30-day terms (due today / first day overdue)"
     assert "invoice_date_human" in rec
-    assert "Oct 3, 2026" in rec["invoice_date_human"]
+
+    raw_invoice_static = dict(raw_invoice, id=33246, inv_ref="33246-2026-10", invoice_date="2026-10-03T03:53:45-05:00")
+    db.orders_flat = Collection([raw_invoice_static])
+    res_static = await get_record("invoices", "33246-2026-10", database=db)
+    assert "Oct 3, 2026" in res_static["record"]["invoice_date_human"]
 
 
 # ---------------------------------------------------------------------------
@@ -1039,4 +1049,289 @@ def test_whatsapp_top_contacts_direction_breakdown_mismatch_shows_dash():
     }]
     table = _format_tool_table("get_whatsapp_top_contacts", items)
     assert "| Jane Doe | Contact | Acme Corp | 2 | — | — |" in table
+
+
+# ---------------------------------------------------------------------------
+# ISSUE 1: Reconciled Overdue Invoice Definitions & Differing Invoices
+# ---------------------------------------------------------------------------
+
+def test_overdue_reconciliation_exact_differing_invoices():
+    """Pin the two differing invoices between Overview Tile (processors.unpaid_invoices)
+    and Chat Overdue (chat_tools.get_invoices):
+    - Order 30244 ($1,680.00, HILL COUNTRY HEMP)
+    - Order 30181 ($600.00, C Store Product)
+    Both have payment_status=2 (Paid) in raw ERP data but amount_paid=0 and balance>0.
+    Overview tile excludes them (268 invoices, $1,775,467.31);
+    Chat tool includes them (270 invoices, $1,777,747.31). Difference is exactly $2,280.00.
+    """
+    from app.services import processors
+    from app.config import settings
+
+    now = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
+    old_date = (now - timedelta(days=40)).isoformat()
+
+    inv_normal = {
+        "id": 1001, "inv_ref": "INV-1001", "total_amount": 1000.0, "amount_paid": 0.0,
+        "payment_status": 0, "payment_status_label": "Not Paid", "invoice_date": old_date,
+    }
+    inv_30244 = {
+        "id": 30244, "inv_ref": "30244-2026-04", "total_amount": 1680.0, "amount_paid": 0.0,
+        "payment_status": 2, "payment_status_label": "Paid", "invoice_date": old_date,
+    }
+    inv_30181 = {
+        "id": 30181, "inv_ref": "30181-2026-04", "total_amount": 600.0, "amount_paid": 0.0,
+        "payment_status": 2, "payment_status_label": "Paid", "invoice_date": old_date,
+    }
+    orders = [inv_normal, inv_30244, inv_30181]
+
+    # Overview tile predicate: balance truth wins (Option A) — includes all three
+    p_unpaid = processors.unpaid_invoices(orders, now)
+    p_overdue = [r for r in p_unpaid if r.get("overdue")]
+    assert len(p_overdue) == 3
+    assert {r["id"] for r in p_overdue} == {1001, 30244, 30181}
+    assert sum(r["balance"] for r in p_overdue) == 3280.0
+
+    # Chat tool predicate: balances > 0 and age > threshold includes all three
+    matched = []
+    for row in orders:
+        total = processors.to_number(row.get("total_amount"))
+        balance = round(total - processors.to_number(row.get("amount_paid")), 2)
+        if balance <= 0:
+            continue
+        age = processors.age_days(processors.parse_date(row.get("invoice_date")), now) or 0.0
+        if age <= settings.OVERDUE_INVOICE_DAYS:
+            continue
+        matched.append(row)
+    assert len(matched) == 3
+    assert {r["id"] for r in matched} == {1001, 30244, 30181}
+    assert sum(round(processors.to_number(r["total_amount"]) - processors.to_number(r["amount_paid"]), 2) for r in matched) == 3280.0
+
+    # Reconciled: Tile overdue set == Chat overdue set (identical IDs, count, and total)
+    tile_ids = {r["id"] for r in p_overdue}
+    chat_ids = {r["id"] for r in matched}
+    assert tile_ids == chat_ids
+    assert len(p_overdue) == len(matched) == 3
+    assert sum(r["balance"] for r in p_overdue) == sum(round(processors.to_number(r["total_amount"]) - processors.to_number(r["amount_paid"]), 2) for r in matched) == 3280.0
+
+
+# ---------------------------------------------------------------------------
+# ISSUE 2: Stuck Leads Predicate & Exit Conditions
+# ---------------------------------------------------------------------------
+
+def test_stuck_leads_predicate_and_exit_conditions():
+    """Verify stuck lead predicate conditions and exit conditions:
+    - All conditions match -> counts as stuck
+    - Fails each single condition -> does not count
+    - Aging past window (> 14 days) -> drops out
+    - Status changes out of New/Attempted -> drops out
+    - Flagged by desk (flagReason) -> drops out
+    - Desk stage leaves open -> drops out
+    """
+    from app.services import processors
+
+    now = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
+    recent_date = (now - timedelta(days=5)).isoformat()
+    old_date = (now - timedelta(days=20)).isoformat()
+
+    def make_lead(**kwargs):
+        base = {
+            "zohoLeadId": "lead-1",
+            "status": "New",
+            "description": "Need 5000 custom vinyl pouches with zip lock",
+            "createdAt": recent_date,
+            "lastActivityAt": recent_date,
+            "leadDesk": {"stage": "open", "flagReason": ""},
+        }
+        base.update(kwargs)
+        return base
+
+    # 1. Matching all conditions -> counts
+    valid_lead = make_lead()
+    assert len(processors.stuck_leads([valid_lead], now, days=14)) == 1
+
+    # Also status 'Attempted to Contact' counts
+    attempted_lead = make_lead(status="Attempted to Contact")
+    assert len(processors.stuck_leads([attempted_lead], now, days=14)) == 1
+
+    # 2. Exit condition / failure: Status leaves New / Attempted to Contact
+    for non_stuck_status in ["Converted", "Contacted", "Junk Lead", "Lost"]:
+        assert len(processors.stuck_leads([make_lead(status=non_stuck_status)], now, days=14)) == 0
+
+    # 3. Exit condition / failure: Missing or empty description
+    assert len(processors.stuck_leads([make_lead(description="")], now, days=14)) == 0
+    assert len(processors.stuck_leads([make_lead(description="   ")], now, days=14)) == 0
+
+    # 4. Exit condition / failure: LeadDesk flags the lead
+    assert len(processors.stuck_leads([make_lead(leadDesk={"stage": "open", "flagReason": "Customer opted out"})], now, days=14)) == 0
+
+    # 5. Exit condition / failure: LeadDesk stage leaves 'open'
+    assert len(processors.stuck_leads([make_lead(leadDesk={"stage": "in_progress", "flagReason": ""})], now, days=14)) == 0
+
+    # 6. Exit condition / failure: Aging past window (age > 14 days)
+    aged_out_lead = make_lead(createdAt=old_date, lastActivityAt=old_date)
+    assert len(processors.stuck_leads([aged_out_lead], now, days=14)) == 0
+    # But if window is widened to 25 days, the aged lead appears
+    assert len(processors.stuck_leads([aged_out_lead], now, days=25)) == 1
+
+
+# ---------------------------------------------------------------------------
+# ISSUE 3: Open Quotes vs Stale Quotes Set Relationship
+# ---------------------------------------------------------------------------
+
+def test_open_quotes_vs_stale_quotes_subsets_and_windows():
+    """Verify that:
+    - Stale quotes are a subset of open quotes (stale ⊆ open)
+    - With the same amount field, stale value <= open value
+    - A fresh quote (< 3 days) counts as open but NOT stale
+    - A quote older than window end (> 30 days) counts as open but NOT stale
+    - processors.stale_quotes is deterministic regardless of input ordering
+    """
+    from app.services import processors
+
+    now = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
+    fresh_date = (now - timedelta(days=1)).isoformat()
+    stale_date_1 = (now - timedelta(days=10)).isoformat()
+    stale_date_2 = (now - timedelta(days=10, seconds=30)).isoformat()
+    old_date = (now - timedelta(days=45)).isoformat()
+
+    quotes = [
+        {"id": 1, "status": "Estimate", "amount": 500.0, "created_at": fresh_date, "customer": {"id": 101}},
+        {"id": 2, "status": "Quote Created", "amount": 1200.0, "created_at": stale_date_1, "customer": {"id": 102}},
+        {"id": 3, "status": "Quote Created", "amount": 0.0, "created_at": stale_date_2, "customer": {"id": 102}},
+        {"id": 4, "status": "Quote Created", "amount": 3000.0, "created_at": old_date, "customer": {"id": 103}},
+        {"id": 5, "status": "Cancelled", "amount": 7000.0, "created_at": stale_date_1, "customer": {"id": 104}},
+        {"id": 6, "status": "Quote Created", "amount": 4000.0, "created_at": stale_date_1, "customer": {"id": 105}},
+    ]
+    converted_ids = {6}
+
+    open_q = processors.open_quotes(quotes, now, order_quote_ids=converted_ids)
+    open_ids = {r["id"] for r in open_q}
+    assert open_ids == {1, 2, 3, 4}
+    open_total = sum(r["amount"] for r in open_q)
+    assert open_total == 4700.0
+
+    stale_q = processors.stale_quotes(quotes, now, order_quote_ids=converted_ids)
+    stale_ids = {r["id"] for r in stale_q}
+    assert stale_ids == {2}
+    stale_total = sum(r["amount"] for r in stale_q)
+    assert stale_total == 1200.0
+
+    assert stale_ids.issubset(open_ids)
+    assert stale_total <= open_total
+
+    stale_q_rev = processors.stale_quotes(list(reversed(quotes)), now, order_quote_ids=converted_ids)
+    assert {r["id"] for r in stale_q_rev} == {2}
+    assert sum(r["amount"] for r in stale_q_rev) == 1200.0
+
+
+# ---------------------------------------------------------------------------
+# ISSUE 4: Exact Re-Index Command String Enforced
+# ---------------------------------------------------------------------------
+
+def test_exact_reindex_command_enforced():
+    """Verify that any variant missing underscores or path is rejected, and
+    the exact 'server/run_whatsapp_index.py --full' is required.
+    """
+    tool_results = [{
+        "tool": "get_whatsapp_latest_messages",
+        "result": {"coverage": {"label": "Indexed 10 of 100 records"}},
+    }]
+
+    bad_answers = [
+        "Please run server/runwhatsappindex.py --full to re-index.",
+        "Run runwhatsappindex to reindex.",
+        "Execute server/run_whatsappindex.py --full.",
+        "Run run_whatsapp_index.py --full without server path.",
+    ]
+    for bad in bad_answers:
+        errors = _answer_consistency_errors(bad, tool_results, None)
+        assert any("re-index command must be 'server/run_whatsapp_index.py --full'" in err for err in errors), f"Expected error for: {bad}"
+
+    good = (
+        "The WhatsApp index is partial.\n"
+        "Option 3: Run a full index sweep via `server/run_whatsapp_index.py --full`."
+    )
+    assert not any("re-index command" in err for err in _answer_consistency_errors(good, tool_results, None))
+
+
+# ---------------------------------------------------------------------------
+# ISSUE 5: Tool Routing for Latest Messages vs Ranking
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_tool_routing_latest_messages_vs_top_contacts():
+    """Verify that:
+    - 'fetch all latest WhatsApp messages for all customers' routes to get_whatsapp_latest_messages (newest first).
+    - ranking questions route to get_whatsapp_top_contacts (count descending).
+    """
+    db = business_db()
+    records = [
+        {
+            "_id": "wa-1",
+            "name": "Mrs Saad",
+            "record_type": "Lead",
+            "company": "Saad Co",
+            "whatsapp_count": 480,
+            "latest_at": "2026-11-02T19:03:11+00:00",
+            "latest_direction": "Inbound",
+            "latest_text": "Voice call",
+        },
+        {
+            "_id": "wa-2",
+            "name": "Website Chat Visitor",
+            "record_type": "Lead",
+            "company": "",
+            "whatsapp_count": 5,
+            "latest_at": "2026-11-02T22:19:00+00:00",
+            "latest_direction": "Inbound",
+            "latest_text": "Need quote",
+        },
+    ]
+    db.customer360_whatsapp = Collection(records)
+    db.chat_threads = FakeCollection([{"thread_id": "thread-wa-route", "turns": []}])
+    db.chat_logs = FakeCollection()
+
+    model = FakeModel([
+        _tool_message(1, "get_whatsapp_top_contacts", {}),
+        plain_answer("Here are the latest messages:\n1. Website Chat Visitor (2026-11-02T22:19:00+00:00)\n2. Mrs Saad"),
+    ])
+
+    result = await run_chat(
+        "thread-wa-route",
+        "fetch all latest WhatsApp messages for all customers",
+        database=db,
+        model=model,
+    )
+    assert result["tools_used"] == ["get_whatsapp_latest_messages"]
+    assert "Website Chat Visitor" in result["text"]
+
+
+# ---------------------------------------------------------------------------
+# MINOR ITEM: '1 day overdue' Singular Grammar
+# ---------------------------------------------------------------------------
+
+def test_singular_day_overdue_grammar():
+    """Verify that 1 day overdue emits '1 day overdue' (singular), while 2 days emits '2 days overdue'."""
+    from app.agents.chat_tools import _invoice_row
+
+    now = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
+    inv_1_day = {
+        "id": 101, "inv_ref": "INV-101", "total_amount": 100.0, "amount_paid": 0.0,
+        "invoice_date": (now - timedelta(days=31)).isoformat(),
+    }
+    row_1 = _invoice_row(inv_1_day, now)
+    assert row_1["days_overdue"] == 1
+    assert row_1["days_overdue_label"] == "1 day overdue"
+
+    inv_2_days = {
+        "id": 102, "inv_ref": "INV-102", "total_amount": 200.0, "amount_paid": 0.0,
+        "invoice_date": (now - timedelta(days=32)).isoformat(),
+    }
+    row_2 = _invoice_row(inv_2_days, now)
+    assert row_2["days_overdue"] == 2
+    assert row_2["days_overdue_label"] == "2 days overdue"
+
+    errs = _answer_consistency_errors("Invoice 101 is 1 days overdue.", [], None)
+    assert any("grammar error: '1 days overdue' should be '1 day overdue'" in e for e in errs)
+
 

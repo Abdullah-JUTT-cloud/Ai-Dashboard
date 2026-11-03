@@ -133,7 +133,7 @@ export function OverviewPanel({
           value={stuckLeads ? stuckLeads.total.toLocaleString("en-US") : "—"}
           detail={
             stuckLeads
-              ? `Active in the last ${stuckLeads.days} days with a description · open the Leads tab`
+              ? `CRM live rule: Active in last ${stuckLeads.days} days with a description · open Leads tab`
               : "Waiting for stuck leads"
           }
           onActivate={() => onSelectTab("leads")}

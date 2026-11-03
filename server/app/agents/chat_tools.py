@@ -1374,7 +1374,7 @@ def _invoice_row(row: dict, now: datetime) -> dict:
     overdue_lbl = (
         "0 days past 30-day terms (due today / first day overdue)"
         if days_over == 0
-        else f"{days_over} days overdue"
+        else ("1 day overdue" if days_over == 1 else f"{days_over} days overdue")
     )
     return {
         "invoice_id": row.get("id"),
@@ -2547,7 +2547,7 @@ async def get_record(collection: str, id: str, database: Any = None) -> dict:
         overdue_lbl = (
             "0 days past 30-day terms (due today / first day overdue)"
             if days_over == 0
-            else f"{days_over} days overdue"
+            else ("1 day overdue" if days_over == 1 else f"{days_over} days overdue")
         )
         record["balance"] = balance
         record["days_invoice_age"] = days_age
@@ -3502,13 +3502,13 @@ CHAT_TOOLS = [
     ),
     ChatTool(
         "get_whatsapp_latest_messages",
-        "THE WhatsApp inbox over all people (Leads, Contacts and Customers - the CRM has no 'patients' record type): one paged list, newest message first, of each person's LATEST WhatsApp message - name, record type, company, message text, time and direction (Inbound/Outbound). Use this for 'fetch/show all (the) latest WhatsApp messages' questions - never the follow-up queue, which is about waiting, not messages. It lists ONLY people with at least one indexed WhatsApp message; a 'never messaged' or zero-message question is NOT answerable from this index while the coverage is partial. Real filters it accepts: direction ('Inbound' or 'Outbound') and a latest-message date range (date_from/date_to) - offer exactly these and nothing else. 'CSV' means CSV TEXT printed in the answer, never a file or download. It reads the local WhatsApp index (Mongo only, never a live CRM call) and the result's coverage block says exactly how far the index reaches ('Indexed N of M person records, as of T') - quote that coverage in the answer, and never present index data as live CRM data or a partial index as complete. Sets that fit one page come back whole; larger sets page, and a continuation keeps THIS page's limit and filters with offset=next_offset - never re-choose the page size. A live CRM sweep for never-messaged is infeasible (~30,000 calls) and must never be offered; allowed options are: (a) page the have-messages set, (b) CSV text export to compare offline, (c) full re-index via the runner." + PAGING_NOTE,
+        "THE WhatsApp inbox over all people (Leads, Contacts and Customers - the CRM has no 'patients' record type): one paged list, newest message first, of each person's LATEST WhatsApp message - name, record type, company, message text, time and direction (Inbound/Outbound). Use this for 'fetch/show all (the) latest WhatsApp messages' questions (including 'for all customers/contacts') - never the follow-up queue, and NEVER get_whatsapp_top_contacts (which ranks by count, not time). It lists ONLY people with at least one indexed WhatsApp message; a 'never messaged' or zero-message question is NOT answerable from this index while the coverage is partial. Real filters it accepts: direction ('Inbound' or 'Outbound') and a latest-message date range (date_from/date_to) - offer exactly these and nothing else. 'CSV' means CSV TEXT printed in the answer, never a file or download. It reads the local WhatsApp index (Mongo only, never a live CRM call) and the result's coverage block says exactly how far the index reaches ('Indexed N of M person records, as of T') - quote that coverage in the answer, and never present index data as live CRM data or a partial index as complete. Sets that fit one page come back whole; larger sets page, and a continuation keeps THIS page's limit and filters with offset=next_offset - never re-choose the page size. A live CRM sweep for never-messaged is infeasible (~30,000 calls) and must never be offered; allowed options are: (a) page the have-messages set, (b) CSV text export to compare offline, (c) full re-index via the runner." + PAGING_NOTE,
         WhatsAppLatestArgs,
         get_whatsapp_latest_messages,
     ),
     ChatTool(
         "get_whatsapp_top_contacts",
-        "People (Leads, Contacts, Customers) RANKED by WhatsApp message count, most first: name, record type, company, whatsapp_count and latest_at per row. THE tool for 'who has more / the most WhatsApp messages', 'top WhatsApp customers', 'rank contacts by message count' - never the follow-up queue, which holds no counts. It covers ONLY people with at least ONE WhatsApp message: it can never answer 'who has NEVER had a WhatsApp message' or zero-message questions while the index is partial - do not call it to fill space on such a question, answer honestly with the limit + coverage instead. Reads the local WhatsApp index (Mongo only, never a live CRM call); quote the result's coverage block (indexed N of M, as of T) and never present it as live CRM data. A live CRM sweep for never-messaged is infeasible (~30,000 calls) and must never be offered; allowed options are: (a) page the have-messages set, (b) CSV text export to compare offline, (c) full re-index via the runner." + PAGING_NOTE,
+        "People (Leads, Contacts, Customers) RANKED by WhatsApp message count, most first: name, record type, company, whatsapp_count and latest_at per row. THE tool for 'who has more / the most WhatsApp messages', 'top WhatsApp customers', 'rank contacts by message count' - never for 'latest messages' questions (use get_whatsapp_latest_messages instead), and never the follow-up queue, which holds no counts. It covers ONLY people with at least ONE WhatsApp message: it can never answer 'who has NEVER had a WhatsApp message' or zero-message questions while the index is partial - do not call it to fill space on such a question, answer honestly with the limit + coverage instead. Reads the local WhatsApp index (Mongo only, never a live CRM call); quote the result's coverage block (indexed N of M, as of T) and never present it as live CRM data. A live CRM sweep for never-messaged is infeasible (~30,000 calls) and must never be offered; allowed options are: (a) page the have-messages set, (b) CSV text export to compare offline, (c) full re-index via the runner." + PAGING_NOTE,
         RowsArgs,
         get_whatsapp_top_contacts,
     ),

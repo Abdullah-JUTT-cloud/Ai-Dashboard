@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app.services import processors
 
 NOW = datetime(2026, 10, 20, 12, 0, 0, tzinfo=timezone.utc)
@@ -155,7 +157,7 @@ def test_unpaid_invoices_balance_and_overdue_flag():
                 amount_paid=400.0,
                 invoice_date=(NOW - timedelta(days=10)).isoformat(),
             ),
-            order(id=3, payment_status=2, payment_status_label="Paid"),  # excluded
+            order(id=3, payment_status=2, payment_status_label="Paid", amount_paid=500.0),  # excluded: balance=0
         ],
         NOW,
     )
@@ -178,6 +180,95 @@ def test_unpaid_invoices_drops_zero_total_nulls_and_zero_balance():
         NOW,
     )
     assert [(row["id"], row["balance"]) for row in rows] == [(3, 250.0)]
+
+
+def test_unpaid_invoices_paid_flag_with_positive_balance_included():
+    """Requirement 5(a): Paid flag + balance > 0 + age > 30 -> INCLUDED in tile set."""
+    inv = order(
+        id=30244,
+        payment_status=2,
+        payment_status_label="Paid",
+        total_amount=1680.0,
+        amount_paid=0.0,
+        invoice_date=(NOW - timedelta(days=40)).isoformat(),
+    )
+    rows = processors.unpaid_invoices([inv], NOW)
+    assert len(rows) == 1
+    assert rows[0]["id"] == 30244
+    assert rows[0]["balance"] == 1680.0
+    assert rows[0]["overdue"] is True
+
+
+def test_unpaid_invoices_paid_flag_with_zero_balance_excluded():
+    """Requirement 5(b): Paid flag + balance = 0 -> excluded."""
+    inv = order(
+        id=30001,
+        payment_status=2,
+        payment_status_label="Paid",
+        total_amount=500.0,
+        amount_paid=500.0,
+        invoice_date=(NOW - timedelta(days=40)).isoformat(),
+    )
+    rows = processors.unpaid_invoices([inv], NOW)
+    assert len(rows) == 0
+
+
+def test_unpaid_invoices_cancelled_and_draft_still_excluded():
+    """Requirement 5(c): Draft empty invoice (payment_status=None, total=0) and zero balance are excluded."""
+    draft_inv = order(id=1, payment_status=None, total_amount=0.0, amount_paid=0.0)
+    zero_bal_inv = order(id=2, payment_status=0, total_amount=200.0, amount_paid=200.0)
+    no_date_inv = order(id=3, payment_status=0, total_amount=300.0, amount_paid=0.0, invoice_date=None)
+    valid_inv = order(id=4, payment_status=0, total_amount=400.0, amount_paid=0.0, invoice_date=(NOW - timedelta(days=5)).isoformat())
+
+    rows = processors.unpaid_invoices([draft_inv, zero_bal_inv, no_date_inv, valid_inv], NOW)
+    assert len(rows) == 1
+    assert rows[0]["id"] == 4
+    assert rows[0]["balance"] == 400.0
+
+
+@pytest.mark.asyncio
+async def test_tile_set_equals_chat_overdue_set_on_fixtures():
+    """Requirement 5(d): tile set (metrics.invoice_totals overdue) == chat overdue set on fixtures."""
+    from app.services import metrics
+    from app.agents import chat_tools
+    from test_chat import FakeCollection
+
+    orders = [
+        # Normal overdue invoice
+        order(id=101, payment_status=0, total_amount=1000.0, amount_paid=0.0, invoice_date=(NOW - timedelta(days=45)).isoformat()),
+        # Normal current (not overdue) invoice
+        order(id=102, payment_status=0, total_amount=500.0, amount_paid=0.0, invoice_date=(NOW - timedelta(days=10)).isoformat()),
+        # Paid flag with zero balance -> excluded from both
+        order(id=103, payment_status=2, total_amount=300.0, amount_paid=300.0, invoice_date=(NOW - timedelta(days=50)).isoformat()),
+        # Paid flag with balance > 0 and age > 30 (Order 30244) -> included in both
+        order(id=30244, payment_status=2, total_amount=1680.0, amount_paid=0.0, invoice_date=(NOW - timedelta(days=40)).isoformat()),
+        # Paid flag with balance > 0 and age > 30 (Order 30181) -> included in both
+        order(id=30181, payment_status=2, total_amount=600.0, amount_paid=0.0, invoice_date=(NOW - timedelta(days=35)).isoformat()),
+        # Draft empty invoice -> excluded from both
+        order(id=104, payment_status=None, total_amount=0.0, amount_paid=0.0, invoice_date=(NOW - timedelta(days=40)).isoformat()),
+    ]
+
+    totals = metrics.invoice_totals(orders, NOW)
+    tile_unpaid = processors.unpaid_invoices(orders, NOW)
+    tile_overdue_rows = [r for r in tile_unpaid if r.get("overdue")]
+    tile_overdue_ids = {r["id"] for r in tile_overdue_rows}
+    tile_overdue_sum = round(sum(r["balance"] for r in tile_overdue_rows), 2)
+
+    assert totals["overdue_count"] == len(tile_overdue_rows) == 3
+    assert totals["overdue_total"] == tile_overdue_sum == 3280.0
+    assert tile_overdue_ids == {101, 30244, 30181}
+
+    class FakeDb:
+        def __init__(self, rows):
+            self.orders_flat = FakeCollection(rows)
+
+    chat_res = await chat_tools.get_invoices(overdue_only=True, limit=100, database=FakeDb(orders))
+    chat_overdue_ids = {r["invoice_id"] for r in chat_res["items"]}
+    chat_overdue_sum = chat_res["sum_balance"]
+
+    assert tile_overdue_ids == chat_overdue_ids
+    assert totals["overdue_count"] == chat_res["total_count"] == 3
+    assert totals["overdue_total"] == chat_overdue_sum == 3280.0
 
 
 # ------------------------------------------------------------ stalled_orders

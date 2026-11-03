@@ -153,7 +153,9 @@ HOW TO WORK
    live in the CRM per record; the cross-contact view is the local
    WhatsApp index. "Fetch/show all latest WhatsApp messages" -> call
    get_whatsapp_latest_messages; "who has more/most WhatsApp messages",
-   "rank by message count" -> call get_whatsapp_top_contacts. Both read
+   "rank by message count" -> call get_whatsapp_top_contacts.
+   (For "latest messages for all customers/contacts", always call get_whatsapp_latest_messages
+   ordered by latest_at descending, newest first; never call get_whatsapp_top_contacts which ranks by count.) Both read
    Mongo only, and the answer must carry the tool's coverage line
    ("Indexed N of M person records, as of T") - never present index data
    as live CRM data, and never claim the list is complete when the
@@ -337,6 +339,7 @@ once, and do not claim that caused the nonpayment. overdue=false is an age flag,
 not proof of terms.
 OVERDUE INVOICE TERMS. Invoices exceeding 30-day terms are overdue. For an invoice with
 0 days overdue, clarify it as: '0 days past 30-day terms (due today / first day overdue)'.
+For 1 day overdue, write '1 day overdue' (singular), never '1 days overdue'. For N > 1, write 'N days overdue'.
 
 LANGUAGE. Match the user's language and script: English stays English, Urdu
 script stays Urdu script, Roman Urdu stays wholly Roman Urdu - translate
@@ -1149,7 +1152,7 @@ def _format_tool_csv(tool_name: str, items: list[dict], filename: str) -> str:
                 row.get("order_status") or "",
                 row.get("invoice_date") or "",
                 row.get("due_date") or "",
-                row.get("days_overdue_label") or (f"{row.get('days_overdue')} days overdue" if row.get("days_overdue") is not None else ""),
+                row.get("days_overdue_label") or ("1 day overdue" if row.get("days_overdue") == 1 else f"{row.get('days_overdue')} days overdue" if row.get("days_overdue") is not None else ""),
             ])
     elif "payment" in tool_name:
         writer.writerow(["Payment ID", "Customer", "Amount", "Payment Date", "Payment Method", "Status"])
@@ -1266,7 +1269,7 @@ def _format_tool_table(tool_name: str, items: list[dict], page: dict | None = No
             amt = f"${row.get('total_amount', 0.0):.2f}" if isinstance(row.get("total_amount"), (int, float)) else str(row.get("total_amount") or "—")
             bal = f"${row.get('balance', 0.0):.2f}" if isinstance(row.get("balance"), (int, float)) else str(row.get("balance") or "—")
             stat = str(row.get("payment_status") or "—")
-            over = str(row.get("days_overdue_label") or (f"{row.get('days_overdue')} days overdue" if row.get("days_overdue") is not None else "No"))
+            over = str(row.get("days_overdue_label") or ("1 day overdue" if row.get("days_overdue") == 1 else f"{row.get('days_overdue')} days overdue" if row.get("days_overdue") is not None else "No"))
             lines.append(f"| {inv} | {cust} | {amt} | {bal} | {stat} | {over} |")
     elif "payment" in tool_name:
         lines.append("| Payment | Customer | Amount | Date | Status |")
@@ -1631,13 +1634,18 @@ def _answer_consistency_errors(text: str, tool_results: list[dict], named_period
     if re.search(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+", text_no_code):
         errors.append("answer contains raw microsecond timestamp; use human-readable format (e.g. Nov 2, 2026, 9:54 PM UTC)")
 
-    # Issue 5: Pluralization check (reject "1 rows")
+    # Pluralization check (reject "1 rows")
     if re.search(r"\b1\s+rows\b", text, re.I):
         errors.append("pluralization error: '1 rows' should be '1 row'")
 
-    # Issue 5: Re-index runner command check
-    if re.search(r"\brunwhatsappindex\b", text, re.I):
-        errors.append("re-index command must be 'server/run_whatsapp_index.py --full'")
+    # Grammar check (reject "1 days overdue")
+    if re.search(r"\b1\s+days\s+overdue\b", text, re.I):
+        errors.append("grammar error: '1 days overdue' should be '1 day overdue'")
+
+    # Issue 4: Re-index runner command check (enforce exact 'server/run_whatsapp_index.py --full')
+    if re.search(r"run_?whatsapp_?index", text, re.I):
+        if "server/run_whatsapp_index.py --full" not in text:
+            errors.append("re-index command must be 'server/run_whatsapp_index.py --full'")
 
     return list(dict.fromkeys(errors))
 
@@ -2796,6 +2804,14 @@ def build_chat_graph(model: Any = None, tools: list | None = None):
                 remaining = MAX_TOOL_CALLS - count
                 for index, call in enumerate(calls):
                     name = str(call.get("name") or "")
+                    if name in ("get_whatsapp_latest_messages", "get_whatsapp_top_contacts"):
+                        q_lower = _last_user_text(messages).lower()
+                        is_ranking = bool(re.search(r"\b(?:most|more|top|rank|ranking|highest)\b", q_lower))
+                        is_latest = bool(re.search(r"\b(?:latest|recent|newest)\b", q_lower))
+                        if is_latest and not is_ranking and name == "get_whatsapp_top_contacts":
+                            name = "get_whatsapp_latest_messages"
+                        elif is_ranking and not is_latest and name == "get_whatsapp_latest_messages":
+                            name = "get_whatsapp_top_contacts"
                     call_id = str(call.get("id") or f"tool-{count + index + 1}")
                     if index >= remaining:
                         result = {"error": "The per-question tool-call limit has been reached."}

@@ -16,17 +16,21 @@ export function StuckLeadsTable({
   totalCount,
   rowLimit,
   onShowMore,
+  title = "Stuck leads",
+  emptyMessage = "No leads match the stuck-lead filter right now.",
 }: {
   rows: StuckLead[];
   totalCount: number;
   rowLimit: number;
   onShowMore: () => void;
+  title?: string;
+  emptyMessage?: string;
 }) {
   const visible = rows.slice(0, rowLimit);
   return (
-    <TableShell title="Stuck leads" icon={UserX} count={visible.length} totalCount={totalCount}>
+    <TableShell title={title} icon={UserX} count={visible.length} totalCount={totalCount}>
       {rows.length === 0 ? (
-        <EmptyNote>No leads match the stuck-lead filter right now.</EmptyNote>
+        <EmptyNote>{emptyMessage}</EmptyNote>
       ) : (
         <>
           <div className="overflow-x-auto">

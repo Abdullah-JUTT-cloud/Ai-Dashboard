@@ -211,7 +211,6 @@ async def _unpaid_signal(database, now: datetime, days: Optional[int]) -> tuple[
     async for row in _stream(
         database.orders_flat,
         [
-            {"$match": {"payment_status": {"$ne": processors.PAYMENT_STATUS_PAID}}},
             {"$project": ORDER_BALANCE_FIELDS},
         ],
     ):
@@ -239,7 +238,6 @@ async def _unpaid_signal(database, now: datetime, days: Optional[int]) -> tuple[
     async for row in _stream(
         database.orders_flat,
         [
-            {"$match": {"payment_status": {"$ne": processors.PAYMENT_STATUS_PAID}}},
             {
                 "$addFields": {
                     "balance": {

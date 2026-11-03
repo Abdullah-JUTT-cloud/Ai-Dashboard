@@ -17,6 +17,7 @@ import {
   emptyStuckLeads,
   signalsReport,
   snapshotFixture,
+  stuckLead,
   stuckLeadsFixture,
 } from "./fixtures";
 import type { SignalsQuery, SignalsReport, StalledOrder } from "@/types/api";
@@ -236,4 +237,118 @@ describe("LeadsPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
     expect(leads.retry).toHaveBeenCalled();
   });
+
+  it("renders category filter pills with counts and triggers category selection", () => {
+    const setSelectedCategory = vi.fn();
+    const leads = leadsState({
+      selectedCategory: "Stuck",
+      setSelectedCategory,
+      categoryCounts: {
+        Stuck: 0,
+        New: 0,
+        Working: 486,
+        Dormant: 12365,
+        Converted: 4472,
+        Lost: 768,
+      },
+      allLeads: {
+        generated_at: "2026-11-03T00:00:00Z",
+        universe: "db.leads",
+        total: 18091,
+        matched_total: 0,
+        category_counts: {
+          Stuck: 0,
+          New: 0,
+          Working: 486,
+          Dormant: 12365,
+          Converted: 4472,
+          Lost: 768,
+        },
+        items: [],
+        limit: 10,
+        offset: 0,
+        next_offset: null,
+        has_more: false,
+      },
+    });
+
+    render(<LeadsPanel leads={leads} />);
+
+    // Verify all categories and counts are rendered
+    expect(screen.getByRole("button", { name: /Working.*486/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Dormant.*12,365/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Converted.*4,472/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Lost.*768/ })).toBeInTheDocument();
+
+    // Verify 0 stuck displays honestly with the other counts
+    expect(screen.getByText(/No leads match the stuck-lead filter right now/)).toBeInTheDocument();
+
+    // Clicking a category invokes setSelectedCategory
+    fireEvent.click(screen.getByRole("button", { name: /Working.*486/ }));
+    expect(setSelectedCategory).toHaveBeenCalledWith("Working");
+  });
+
+  it("overview stuck leads tile count matches leads tab stuck count exactly (tile == tab)", () => {
+    const crmStuckCount = 1834;
+    const testLead = { ...stuckLead({ lead_id: "CRM-1" }), category: "Stuck" };
+    const stuckLeadsData = {
+      generated_at: "2026-11-03T16:26:30Z",
+      days: 14,
+      total: crmStuckCount,
+      items: [testLead],
+    };
+    const leads = leadsState({
+      stuckLeads: stuckLeadsData,
+      selectedCategory: "Stuck",
+      categoryCounts: {
+        Stuck: crmStuckCount,
+        New: 451,
+        Working: 489,
+        Dormant: 11203,
+        Converted: 4472,
+        Lost: 777,
+      },
+      allLeads: {
+        generated_at: "2026-11-03T16:26:30Z",
+        universe: "customer360_leads",
+        total: 19226,
+        matched_total: crmStuckCount,
+        category_counts: {
+          Stuck: crmStuckCount,
+          New: 451,
+          Working: 489,
+          Dormant: 11203,
+          Converted: 4472,
+          Lost: 777,
+        },
+        items: [testLead],
+        limit: 10,
+        offset: 0,
+        next_offset: null,
+        has_more: false,
+        synced_at: "2026-11-03T16:26:30.649812+00:00",
+      },
+    });
+
+    const { unmount: unmountOverview } = render(
+      <OverviewPanel
+        snapshot={snapshotFixture()}
+        signals={signalsReport()}
+        stuckLeads={leads.stuckLeads}
+        onSelectTab={vi.fn()}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    // Overview tile displays formatted CRM stuck count and CRM live rule label
+    expect(screen.getByText("1,834")).toBeInTheDocument();
+    expect(screen.getByText(/CRM live rule/)).toBeInTheDocument();
+    unmountOverview();
+
+    // Leads tab renders the same stuck count in the Stuck category pill and CRM live indicator
+    render(<LeadsPanel leads={leads} />);
+    expect(screen.getByRole("button", { name: /Stuck.*1,834/ })).toBeInTheDocument();
+    expect(screen.getAllByText(/CRM live/).length).toBeGreaterThanOrEqual(1);
+  });
 });
+

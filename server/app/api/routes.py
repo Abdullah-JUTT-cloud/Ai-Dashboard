@@ -31,6 +31,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from app.db import get_db
 from app.config import settings
 from app.schemas.signals import (
+    LeadItem,
+    LeadsResponse,
     SignalsReport,
     StuckLead,
     StuckLeadsResponse,
@@ -156,6 +158,87 @@ async def get_stuck_leads(
         days=days or settings.LEAD_ACTIVE_DAYS,
         total=len(stuck),
         items=stuck[: limit or 100],
+    )
+
+
+@router.get("/leads", response_model=LeadsResponse)
+async def get_all_leads(
+    category: Annotated[
+        Optional[str],
+        Query(
+            description=(
+                "Filter by category: New, Stuck, Working, Dormant, Converted, "
+                "Lost, Other"
+            )
+        ),
+    ] = None,
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    days: Annotated[Optional[int], Query(ge=1, le=90)] = None,
+) -> LeadsResponse:
+    """Paginated leads across all funnel categories, partitioned from the live CRM mirror.
+
+    Categories: New, Stuck, Working, Dormant, Converted, Lost (and Other if any).
+    Every lead in the endpoint's universe (customer360_leads) falls into exactly one category,
+    and category_counts partitions the entire universe.
+    """
+    db = get_db()
+    now = datetime.now(timezone.utc)
+    leads_coll = getattr(db, "customer360_leads", None)
+    if leads_coll is None:
+        leads_coll = db.leads
+        universe = "db.leads"
+    else:
+        universe = "customer360_leads"
+
+    rows = await leads_coll.find({}, processors.LEAD_FIELDS).to_list(50_000)
+    category_counts, all_items = processors.partition_leads(rows, now, days=days)
+
+    synced_at = None
+    try:
+        sync_doc = await leads_coll.find({}, {"synced_at": 1}).sort("synced_at", -1).limit(1).to_list(1)
+        if sync_doc and sync_doc[0].get("synced_at"):
+            synced_at = str(sync_doc[0]["synced_at"])
+    except Exception:
+        pass
+
+    if category:
+        cat_normalized = category.strip().casefold()
+        valid_categories = {c.casefold(): c for c in processors.LEAD_CATEGORIES}
+        if cat_normalized not in valid_categories:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unknown category '{category}'. Must be one of: "
+                    f"{', '.join(processors.LEAD_CATEGORIES)}"
+                ),
+            )
+        target_cat = valid_categories[cat_normalized]
+        matched = [item for item in all_items if item["category"] == target_cat]
+    else:
+        matched = all_items
+
+    total_in_universe = len(rows)
+    matched_total = len(matched)
+    sliced_items = matched[offset : offset + limit]
+    next_offset = (
+        offset + len(sliced_items)
+        if offset + len(sliced_items) < matched_total
+        else None
+    )
+
+    return LeadsResponse(
+        generated_at=now.isoformat(),
+        universe=universe,
+        total=total_in_universe,
+        matched_total=matched_total,
+        category_counts=category_counts,
+        items=sliced_items,
+        limit=limit,
+        offset=offset,
+        next_offset=next_offset,
+        has_more=next_offset is not None,
+        synced_at=synced_at,
     )
 
 

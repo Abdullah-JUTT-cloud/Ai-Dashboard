@@ -5,9 +5,9 @@
 // so StrictMode's double effect mount makes one request, and all state is
 // written only after the request settles.
 
-import { useEffect, useRef, useState } from "react";
-import { fetchStuckLeads } from "@/services/api";
-import type { StuckLeadsResponse } from "@/types/api";
+import { useEffect, useState } from "react";
+import { fetchLeads } from "@/services/api";
+import type { LeadsResponse, StuckLeadsResponse } from "@/types/api";
 import { ROW_PAGE_SIZE } from "@/hooks/use-signals";
 
 export interface StuckLeadsState {
@@ -17,6 +17,12 @@ export interface StuckLeadsState {
   leadRowLimit: number;
   setLeadRowLimit: (updater: (current: number) => number) => void;
   retry: () => void;
+  allLeads?: LeadsResponse | null;
+  allLeadsError?: string;
+  isLoadingAllLeads?: boolean;
+  selectedCategory?: string;
+  setSelectedCategory?: (category: string) => void;
+  categoryCounts?: Record<string, number>;
 }
 
 export function useStuckLeads({
@@ -32,49 +38,74 @@ export function useStuckLeads({
   const [stuckLeadsError, setStuckLeadsError] = useState("");
   const [isLoadingStuckLeads, setIsLoadingStuckLeads] = useState(true);
   const [leadRowLimit, setLeadRowLimit] = useState(ROW_PAGE_SIZE);
-  const requestRef = useRef<Promise<StuckLeadsResponse> | null>(null);
-  const loadedForReloadRef = useRef<number | null>(null);
 
+  const [selectedCategory, setSelectedCategory] = useState("Stuck");
+  const [allLeads, setAllLeads] = useState<LeadsResponse | null>(null);
+  const [allLeadsError, setAllLeadsError] = useState("");
+  const [isLoadingAllLeads, setIsLoadingAllLeads] = useState(false);
+  const [categoryCounts, setCategoryCounts] = useState<Record<string, number>>({});
+
+  // Fetch live CRM leads (feeds both the Overview STUCK LEADS tile and the Leads tab)
   useEffect(() => {
     if (activeTab !== "leads" && activeTab !== "overview") return undefined;
-    const alreadyLoaded =
-      loadedForReloadRef.current === reloadKey &&
-      (stuckLeads !== null || stuckLeadsError !== "");
-    const inFlight = requestRef.current;
-    if (alreadyLoaded && !inFlight) return undefined;
-
     let isActive = true;
-    const request = inFlight ?? fetchStuckLeads();
-    requestRef.current = request;
-    request
+
+    fetchLeads({ category: selectedCategory, limit: leadRowLimit })
       .then((result) => {
-        loadedForReloadRef.current = reloadKey;
         if (!isActive) return;
-        setStuckLeads(result);
+        setAllLeads(result);
+        setAllLeadsError("");
+        if (result.category_counts) {
+          setCategoryCounts(result.category_counts);
+        }
+        const crmStuckCount =
+          result.category_counts?.["Stuck"] ??
+          (selectedCategory === "Stuck" ? result.matched_total : 0);
+        setStuckLeads((prev) => ({
+          generated_at: result.generated_at,
+          days: 14,
+          total: crmStuckCount,
+          items:
+            selectedCategory === "Stuck"
+              ? result.items
+              : (prev?.items ?? []),
+        }));
         setStuckLeadsError("");
       })
       .catch((error: unknown) => {
-        loadedForReloadRef.current = reloadKey;
         if (!isActive) return;
-        setStuckLeadsError(
-          error instanceof Error ? error.message : "Could not load stuck leads.",
-        );
+        const msg =
+          error instanceof Error ? error.message : "Could not load leads.";
+        setAllLeadsError(msg);
+        setStuckLeadsError(msg);
       })
       .finally(() => {
-        if (requestRef.current === request) {
-          requestRef.current = null;
+        if (isActive) {
+          setIsLoadingAllLeads(false);
+          setIsLoadingStuckLeads(false);
         }
-        if (isActive) setIsLoadingStuckLeads(false);
       });
 
     return () => {
       isActive = false;
     };
-  }, [activeTab, reloadKey, stuckLeads, stuckLeadsError]);
+  }, [activeTab, reloadKey, selectedCategory, leadRowLimit]);
+
+  function changeCategory(cat: string) {
+    setIsLoadingAllLeads(true);
+    setSelectedCategory(cat);
+  }
+
+  function changeRowLimit(updater: (current: number) => number) {
+    setIsLoadingAllLeads(true);
+    setLeadRowLimit(updater);
+  }
 
   function retry() {
     setIsLoadingStuckLeads(true);
+    setIsLoadingAllLeads(true);
     setStuckLeadsError("");
+    setAllLeadsError("");
     reload();
   }
 
@@ -83,7 +114,13 @@ export function useStuckLeads({
     stuckLeadsError,
     isLoadingStuckLeads,
     leadRowLimit,
-    setLeadRowLimit,
+    setLeadRowLimit: changeRowLimit,
     retry,
+    allLeads,
+    allLeadsError,
+    isLoadingAllLeads,
+    selectedCategory,
+    setSelectedCategory: changeCategory,
+    categoryCounts,
   };
 }

@@ -10,6 +10,7 @@ import { StuckLeadsTable } from "@/components/dashboard/stuck-leads-table";
 import { UnpaidTable } from "@/components/dashboard/unpaid-table";
 import { ROW_PAGE_SIZE, type SignalsState } from "@/hooks/use-signals";
 import type { StuckLeadsState } from "@/hooks/use-stuck-leads";
+import { formatDateTime } from "@/lib/format";
 
 const STALE_DAY_OPTIONS = [3, 5, 7, 14, 30];
 const STALLED_DAY_OPTIONS = [2, 3, 5, 7, 14];
@@ -127,31 +128,96 @@ export function PipelinePanel({
 }
 
 export function LeadsPanel({ leads }: { leads: StuckLeadsState }) {
+  const currentCategory = leads.selectedCategory ?? "Stuck";
+  const counts = leads.categoryCounts ?? leads.allLeads?.category_counts ?? {};
+
+  const getCategoryCount = (cat: string) => {
+    if (counts[cat] !== undefined) return counts[cat];
+    if (cat === "Stuck" && leads.stuckLeads) return leads.stuckLeads.total;
+    return 0;
+  };
+
+  const rows = leads.allLeads?.items ?? leads.stuckLeads?.items ?? [];
+  const totalCount = leads.allLeads
+    ? leads.allLeads.matched_total
+    : (leads.stuckLeads?.total ?? 0);
+
+  const isLoading =
+    leads.isLoadingAllLeads ||
+    (leads.isLoadingStuckLeads && !leads.stuckLeads && !leads.allLeads);
+  const error = leads.allLeadsError || leads.stuckLeadsError;
+
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-end justify-between gap-4 rounded-2xl border border-border/80 bg-surface/80 p-5 shadow-sm backdrop-blur-md">
-        <div className="max-w-2xl">
-          <h2 className="text-base font-semibold tracking-tight text-foreground">Leads</h2>
-          <p className="mt-1 text-xs leading-relaxed text-muted">
-            Leads stuck before becoming an order: status New or Attempted to Contact, activity
-            within the last {leads.stuckLeads?.days ?? 14} days, a description present, not flagged
-            by the lead desk. The filter and every parsed field come from the backend
-            (`GET /api/leads/stuck`) - this table only renders them.
-          </p>
+      <div className="flex flex-col gap-4 rounded-2xl border border-border/80 bg-surface/80 p-5 shadow-sm backdrop-blur-md">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="max-w-3xl">
+            <h2 className="text-base font-semibold tracking-tight text-foreground">Leads</h2>
+            <p className="mt-1 text-xs leading-relaxed text-muted">
+              Full lead pipeline partitioned by status, age, and activity. Stuck leads use the CRM
+              live rule (status New / Attempted to Contact with activity within 14 days and description
+              present; LeadDesk flags applied where recorded); aged leads move to Dormant; actively
+              engaged to Working; converted and lost categorized from verified CRM records.
+            </p>
+          </div>
+          <div className="inline-flex items-center gap-2 self-start sm:self-auto rounded-lg border border-border/80 bg-surface/60 px-2.5 py-1 text-[11px] font-mono text-muted">
+            <span className="h-2 w-2 rounded-full bg-emerald-500" />
+            <span>
+              CRM live · {leads.allLeads?.synced_at ? `synced ${formatDateTime(leads.allLeads.synced_at)}` : "synced live"}
+            </span>
+          </div>
+        </div>
+
+        {/* Category Filter Pills */}
+        <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-border/40">
+          {(["Stuck", "New", "Working", "Dormant", "Converted", "Lost"] as const).map((cat) => {
+            const isSelected = currentCategory === cat;
+            const count = getCategoryCount(cat);
+            return (
+              <button
+                key={cat}
+                type="button"
+                onClick={() => leads.setSelectedCategory?.(cat)}
+                className={`inline-flex items-center gap-2 rounded-xl px-3.5 py-1.5 text-xs font-medium transition-all ${
+                  isSelected
+                    ? "border border-accent bg-accent/15 text-accent font-semibold shadow-sm"
+                    : "border border-border/80 bg-surface/60 text-muted hover:border-border hover:bg-surface-raised hover:text-foreground"
+                }`}
+              >
+                <span>{cat}</span>
+                <span
+                  className={`rounded-full px-1.5 py-0.5 text-[11px] font-mono tabular-nums ${
+                    isSelected
+                      ? "bg-accent/25 text-accent"
+                      : "bg-surface-raised text-muted"
+                  }`}
+                >
+                  {count.toLocaleString()}
+                </span>
+              </button>
+            );
+          })}
         </div>
       </div>
-      {leads.isLoadingStuckLeads && !leads.stuckLeads ? (
+
+      {isLoading && rows.length === 0 ? (
         <LoadingNote />
-      ) : leads.stuckLeads ? (
+      ) : rows.length > 0 || !error ? (
         <StuckLeadsTable
-          rows={leads.stuckLeads.items}
-          totalCount={leads.stuckLeads.total}
+          rows={rows}
+          totalCount={totalCount}
           rowLimit={leads.leadRowLimit}
           onShowMore={() => leads.setLeadRowLimit((current) => current + ROW_PAGE_SIZE)}
+          title={currentCategory === "Stuck" ? "Stuck leads" : `${currentCategory} leads`}
+          emptyMessage={
+            currentCategory === "Stuck"
+              ? "No leads match the stuck-lead filter right now."
+              : `No leads in the ${currentCategory} category right now.`
+          }
         />
       ) : (
         <ErrorNote
-          message={leads.stuckLeadsError || "Stuck leads are unavailable."}
+          message={error || "Leads are unavailable."}
           onRetry={leads.retry}
         />
       )}

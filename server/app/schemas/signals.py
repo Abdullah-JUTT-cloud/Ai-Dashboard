@@ -152,3 +152,26 @@ class StuckLeadsResponse(Base):
     days: int
     total: int                       # matched rows before the limit was applied
     items: list[StuckLead] = Field(default_factory=list)
+
+
+class LeadItem(StuckLead):
+    category: str = ""
+    desk_stage: Optional[str] = None
+    flag_reason: Optional[str] = None
+    next_action: Optional[str] = None
+    conversion_reason: Optional[str] = None
+
+
+class LeadsResponse(Base):
+    generated_at: str
+    universe: str = "customer360_leads"
+    total: int                       # total mirror leads in the endpoint's universe (customer360_leads)
+    matched_total: int               # matched rows for selected category before pagination
+    category_counts: dict[str, int]  # counts partitioned across all categories (sum == total)
+    items: list[LeadItem] = Field(default_factory=list)
+    limit: int = 10
+    offset: int = 0
+    next_offset: Optional[int] = None
+    has_more: bool = False
+    synced_at: Optional[str] = None
+

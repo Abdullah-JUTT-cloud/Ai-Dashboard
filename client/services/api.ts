@@ -19,6 +19,7 @@ import type {
   SignalsQuery,
   SignalsReport,
   StuckLeadsResponse,
+  LeadsResponse,
   TaskEvent,
 } from "@/types/api";
 import { parseTaskEventBlock, taskEventsUrl } from "@/lib/task-events";
@@ -181,6 +182,38 @@ export function fetchStuckLeads(
   inFlightStuckLeads.set(path, request);
   const clearRequest = () => {
     if (inFlightStuckLeads.get(path) === request) inFlightStuckLeads.delete(path);
+  };
+  void request.then(clearRequest, clearRequest);
+  return request;
+}
+
+// GET /api/leads - paginated leads with category filter & category counts.
+const inFlightLeads = new Map<string, Promise<LeadsResponse>>();
+
+export function fetchLeads(
+  query: {
+    category?: string;
+    limit?: number;
+    offset?: number;
+    days?: number;
+  } = {},
+): Promise<LeadsResponse> {
+  const params = new URLSearchParams();
+  if (query.category !== undefined && query.category !== "") {
+    params.set("category", query.category);
+  }
+  if (query.limit !== undefined) params.set("limit", String(query.limit));
+  if (query.offset !== undefined) params.set("offset", String(query.offset));
+  if (query.days !== undefined) params.set("days", String(query.days));
+  const search = params.size > 0 ? `?${params.toString()}` : "";
+  const path = `/api/leads${search}`;
+  const pending = inFlightLeads.get(path);
+  if (pending) return pending;
+
+  const request = apiFetch<LeadsResponse>(path);
+  inFlightLeads.set(path, request);
+  const clearRequest = () => {
+    if (inFlightLeads.get(path) === request) inFlightLeads.delete(path);
   };
   void request.then(clearRequest, clearRequest);
   return request;

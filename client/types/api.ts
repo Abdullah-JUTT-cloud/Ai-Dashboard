@@ -147,6 +147,37 @@ export interface StuckLeadsResponse {
   items: StuckLead[];
 }
 
+export type LeadCategory =
+  | "New"
+  | "Stuck"
+  | "Working"
+  | "Dormant"
+  | "Converted"
+  | "Lost"
+  | "Other";
+
+export interface LeadItem extends StuckLead {
+  category: LeadCategory | string;
+  desk_stage?: string | null;
+  flag_reason?: string | null;
+  next_action?: string | null;
+  conversion_reason?: string | null;
+}
+
+export interface LeadsResponse {
+  generated_at: string;
+  universe: string;
+  total: number;
+  matched_total: number;
+  category_counts: Record<string, number>;
+  items: LeadItem[];
+  limit: number;
+  offset: number;
+  next_offset: number | null;
+  has_more: boolean;
+  synced_at?: string | null;
+}
+
 // GET /api/metrics and the `snapshot` event from GET /api/live
 // (server/app/services/metrics.py: build_snapshot_from_docs)
 export interface RepMetric {

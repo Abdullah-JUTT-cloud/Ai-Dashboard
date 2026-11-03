@@ -105,8 +105,10 @@ async def latest_finished_run(database: Any) -> tuple[dict | None, dict | None]:
 
 
 def _business_yesterday(now: datetime | None = None) -> date:
-    current = now or datetime.now(timezone.utc)
-    return current.astimezone(BUSINESS_TZ).date() - timedelta(days=1)
+    if now is not None:
+        return now.astimezone(BUSINESS_TZ).date() - timedelta(days=1)
+    from app.services import periods
+    return periods.business_today() - timedelta(days=1)
 
 
 def _money(value: Any) -> float | None:
